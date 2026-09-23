@@ -14,20 +14,26 @@ from zoneinfo import ZoneInfo
 # НАСТРОЙКИ
 # =========================================================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-
-# Поддерживаем оба варианта имени переменной.
-# Можно оставить существующий FOOTBALL_API_KEY в Render.
-PITCH_API_KEY = (
-    os.environ.get("PITCH_API_KEY")
-    or os.environ.get("FOOTBALL_API_KEY")
+TELEGRAM_TOKEN = (
+    os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("BOT_TOKEN")
 )
+
+PITCH_API_KEY = (
+    os.getenv("PITCH_API_KEY")
+    or os.getenv("FOOTBALL_API_KEY")
+)
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN / BOT_TOKEN not found")
 
 if not PITCH_API_KEY:
     raise RuntimeError("PITCH_API_KEY / FOOTBALL_API_KEY not found")
 
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
+)
 
 PITCH_API = "https://api.pitchapi.dev/v1"
 
@@ -37,31 +43,23 @@ PITCH_HEADERS = {
 
 
 # =========================================================
-# СТРАТЕГИЯ LIVE
+# LIVE СТРАТЕГИЯ
 # =========================================================
 
-CHECK_EVERY_MINUTES = 2
+CHECK_EVERY_SECONDS = 120
 
 MIN_MINUTE = 5
 MAX_MINUTE = 85
 
-# Минимальная вероятность сигнала
-MIN_PROBABILITY = 0.60
-
-# Минимальный перевес одной команды
-MIN_ADVANTAGE = 0.15
-
-# Минимальный live-xG суммарно
 MIN_XG = 0.55
-
-# Минимум ударов в створ для сильного сигнала
+MIN_SHOTS = 6
 MIN_ON_TARGET = 2
 
-# Минимальный темп ударов
-MIN_SHOTS = 6
+MIN_PROBABILITY = 0.60
+MIN_ADVANTAGE = 0.15
 
-# Максимальное количество сигналов на один матч
-MAX_SIGNALS_PER_MATCH = 1
+# Сигнал только при наличии минимум 4 сильных факторов
+MIN_FILTERS = 4
 
 
 # =========================================================
@@ -69,10 +67,12 @@ MAX_SIGNALS_PER_MATCH = 1
 # =========================================================
 
 state = {
-    "signals": 0,
     "scans": 0,
+    "signals": 0,
     "bankroll": 1000.0
 }
+
+subscribers = set()
 
 sent_signals = {}
 
@@ -93,18 +93,20 @@ def get_json(url, headers=None):
         timeout=25
     ) as response:
 
-        raw = response.read()
+        return json.loads(
+            response.read()
+        )
 
-        return json.loads(raw)
 
-
-def pitch(endpoint, params=None):
+def pitch_api(endpoint, params=None):
 
     url = PITCH_API + endpoint
 
     if params:
 
-        url += "?" + urllib.parse.urlencode(params)
+        url += "?" + urllib.parse.urlencode(
+            params
+        )
 
     try:
 
@@ -113,14 +115,15 @@ def pitch(endpoint, params=None):
             PITCH_HEADERS
         )
 
-        return result.get("data")
+        return result.get(
+            "data"
+        )
 
     except Exception as e:
 
         print(
             "PITCH API ERROR:",
             endpoint,
-            type(e).__name__,
             str(e)
         )
 
@@ -135,7 +138,7 @@ def telegram(method, data=None):
 
     url = TELEGRAM_API + method
 
-    if data:
+    if data is not None:
 
         body = urllib.parse.urlencode(
             data
@@ -148,11 +151,13 @@ def telegram(method, data=None):
 
     else:
 
-        request = urllib.request.Request(url)
+        request = urllib.request.Request(
+            url
+        )
 
     with urllib.request.urlopen(
         request,
-        timeout=25
+        timeout=30
     ) as response:
 
         return json.loads(
@@ -168,7 +173,8 @@ def send_message(
 
     data = {
         "chat_id": chat_id,
-        "text": text
+        "text": text,
+        "parse_mode": "HTML"
     }
 
     if keyboard:
@@ -189,7 +195,6 @@ def send_message(
 
         print(
             "TELEGRAM ERROR:",
-            type(e).__name__,
             str(e)
         )
 
@@ -210,12 +215,12 @@ def answer_callback(callback_id):
 
         print(
             "CALLBACK ERROR:",
-            e
+            str(e)
         )
 
 
 # =========================================================
-# КЛАВИАТУРЫ
+# КЛАВИАТУРА
 # =========================================================
 
 def main_keyboard():
@@ -255,7 +260,7 @@ def match_keyboard(match_id):
 
             [
                 {
-                    "text": "🔄 Обновить анализ",
+                    "text": "🔄 АНАЛИЗ",
                     "callback_data":
                         f"match:{match_id}"
                 }
@@ -270,7 +275,7 @@ def match_keyboard(match_id):
 
             [
                 {
-                    "text": "🏠 Главное меню",
+                    "text": "🏠 МЕНЮ",
                     "callback_data": "home"
                 }
             ]
@@ -280,7 +285,7 @@ def match_keyboard(match_id):
 
 
 # =========================================================
-# МАТЧИ
+# МАТЧИ СЕГОДНЯ
 # =========================================================
 
 def get_today_matches():
@@ -289,43 +294,69 @@ def get_today_matches():
         ZoneInfo("Europe/Tallinn")
     ).strftime("%Y-%m-%d")
 
-    data = pitch(
+    return_data = pitch_api(
         f"/date/{today}",
         {
             "status": "all"
         }
     )
 
-    if not data:
+    if not return_data:
 
         return []
 
-    return data.get(
+    return return_data.get(
         "matches",
         []
     )
 
 
-def match_is_live(match):
+# =========================================================
+# ВЫЧИСЛЕНИЕ МИНУТЫ
+# =========================================================
 
-    status = str(
-        match.get(
-            "status",
-            ""
+def get_match_minute(match):
+
+    time_utc = match.get(
+        "time_utc"
+    )
+
+    if not time_utc:
+
+        return 0
+
+    try:
+
+        kickoff = datetime.fromisoformat(
+            time_utc.replace(
+                "Z",
+                "+00:00"
+            )
         )
-    ).lower()
 
-    if status in (
-        "finished",
-        "not_started",
-        "cancelled",
-        "postponed"
-    ):
+    except Exception:
 
-        return False
+        return 0
 
-    return True
+    now = datetime.now(
+        timezone.utc
+    )
 
+    minutes = (
+        now - kickoff
+    ).total_seconds() / 60
+
+    return int(
+        max(
+            0,
+            minutes
+        )
+    )
+
+
+# =========================================================
+# LIVE МАТЧИ
+# =========================================================
 
 def get_live_matches():
 
@@ -333,96 +364,87 @@ def get_live_matches():
 
     live = []
 
-    now = datetime.now(
-        timezone.utc
-    )
-
     for match in matches:
 
-        if not match_is_live(match):
-            continue
+        status = str(
+            match.get(
+                "status",
+                ""
+            )
+        ).lower()
 
-        time_utc = match.get(
-            "time_utc"
+        minute = get_match_minute(
+            match
         )
 
-        if not time_utc:
-            continue
+        # PitchAPI status + временной фильтр.
+        # Оставляем несколько вариантов статуса,
+        # чтобы не зависеть от написания статуса.
 
-        try:
+        live_status = (
+            "live" in status
+            or "progress" in status
+            or status == "in_play"
+            or status == "paused"
+            or status == "halftime"
+        )
 
-            kickoff = datetime.fromisoformat(
-                time_utc.replace(
-                    "Z",
-                    "+00:00"
-                )
+        # Дополнительная проверка по времени.
+        time_live = (
+            0 <= minute <= 130
+            and status not in (
+                "finished",
+                "not_started",
+                "cancelled",
+                "postponed"
             )
+        )
 
-        except Exception:
+        if live_status or time_live:
 
-            continue
+            match["_minute"] = minute
 
-        minutes = (
-            now - kickoff
-        ).total_seconds() / 60
-
-        # Матч считаем LIVE примерно
-        # в диапазоне 0–130 минут от начала.
-        if 0 <= minutes <= 130:
-
-            match["_minute_estimate"] = int(
-                max(
-                    0,
-                    minutes
-                )
+            live.append(
+                match
             )
-
-            live.append(match)
 
     return live
 
 
 # =========================================================
-# MATCH DATA
+# MATCH
 # =========================================================
 
 def get_match(match_id):
 
-    return pitch(
+    return pitch_api(
         f"/matches/{match_id}"
     )
 
 
-def get_match_stats(match_id):
+def get_shots(match_id):
 
-    return pitch(
-        f"/matches/{match_id}/stats"
-    )
-
-
-def get_match_shots(match_id):
-
-    return pitch(
+    return pitch_api(
         f"/matches/{match_id}/shots"
     )
 
 
-def get_match_events(match_id):
+def get_events(match_id):
 
-    return pitch(
+    return pitch_api(
         f"/matches/{match_id}/events"
     )
 
 
-def get_match_momentum(match_id):
+def get_momentum(match_id):
 
-    return pitch(
+    return pitch_api(
         f"/matches/{match_id}/momentum"
     )
 
 
 # =========================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# SAFE FLOAT
 # =========================================================
 
 def safe_float(value):
@@ -432,123 +454,40 @@ def safe_float(value):
         if value is None:
             return 0.0
 
-        return float(value)
+        if isinstance(
+            value,
+            (int, float)
+        ):
+
+            return float(value)
+
+        text = str(value)
+
+        # Например:
+        # "329 (82%)" -> 329
+
+        text = text.split(
+            "("
+        )[0].strip()
+
+        return float(text)
 
     except Exception:
 
         return 0.0
 
 
-def get_score(match):
-
-    home = safe_float(
-        match.get(
-            "score_home"
-        )
-    )
-
-    away = safe_float(
-        match.get(
-            "score_away"
-        )
-    )
-
-    return int(home), int(away)
-
-
-def get_minute(match):
-
-    if "_minute_estimate" in match:
-
-        return int(
-            match["_minute_estimate"]
-        )
-
-    return 0
-
-
 # =========================================================
-# STATS PARSER
+# УДАРЫ + xG + xGOT
 # =========================================================
 
-def parse_stats(stats_data):
-
-    result = {
-        "home": {},
-        "away": {}
-    }
-
-    if not stats_data:
-        return result
-
-    periods = stats_data.get(
-        "periods",
-        []
-    )
-
-    all_period = None
-
-    for period in periods:
-
-        if period.get(
-            "period"
-        ) == "All":
-
-            all_period = period
-            break
-
-    if not all_period:
-
-        return result
-
-    groups = all_period.get(
-        "groups",
-        []
-    )
-
-    for group in groups:
-
-        for item in group.get(
-            "items",
-            []
-        ):
-
-            key = item.get(
-                "key"
-            )
-
-            if not key:
-                continue
-
-            result["home"][key] = (
-                safe_float(
-                    item.get(
-                        "home"
-                    )
-                )
-            )
-
-            result["away"][key] = (
-                safe_float(
-                    item.get(
-                        "away"
-                    )
-                )
-
-    return result
-
-
-# =========================================================
-# SHOTS / xG / xGOT
-# =========================================================
-
-def calculate_shot_stats(
+def calculate_shots(
     shots_data,
     home_id,
     away_id
 ):
 
-    data = {
+    result = {
 
         "home_shots": 0,
         "away_shots": 0,
@@ -561,12 +500,11 @@ def calculate_shot_stats(
 
         "home_xgot": 0.0,
         "away_xgot": 0.0
-
     }
 
     if not shots_data:
 
-        return data
+        return result
 
     periods = shots_data.get(
         "periods",
@@ -575,10 +513,12 @@ def calculate_shot_stats(
 
     for period in periods:
 
-        for shot in period.get(
+        shots = period.get(
             "shots",
             []
-        ):
+        )
+
+        for shot in shots:
 
             team_id = shot.get(
                 "team_id"
@@ -598,33 +538,52 @@ def calculate_shot_stats(
 
             on_target = bool(
                 shot.get(
-                    "is_on_target"
+                    "is_on_target",
+                    False
                 )
             )
 
             if team_id == home_id:
 
-                data["home_shots"] += 1
+                result[
+                    "home_shots"
+                ] += 1
 
-                data["home_xg"] += xg
+                result[
+                    "home_xg"
+                ] += xg
 
-                data["home_xgot"] += xgot
+                result[
+                    "home_xgot"
+                ] += xgot
 
                 if on_target:
-                    data["home_on_target"] += 1
+
+                    result[
+                        "home_on_target"
+                    ] += 1
 
             elif team_id == away_id:
 
-                data["away_shots"] += 1
+                result[
+                    "away_shots"
+                ] += 1
 
-                data["away_xg"] += xg
+                result[
+                    "away_xg"
+                ] += xg
 
-                data["away_xgot"] += xgot
+                result[
+                    "away_xgot"
+                ] += xgot
 
                 if on_target:
-                    data["away_on_target"] += 1
 
-    return data
+                    result[
+                        "away_on_target"
+                    ] += 1
+
+    return result
 
 
 # =========================================================
@@ -642,7 +601,10 @@ def count_red_cards(
 
     if not events_data:
 
-        return home_red, away_red
+        return (
+            home_red,
+            away_red
+        )
 
     events = events_data.get(
         "events",
@@ -653,35 +615,18 @@ def count_red_cards(
 
         event_type = str(
             event.get(
-                "type",
+                "event_type",
                 ""
             )
         ).lower()
 
-        detail = str(
-            event.get(
-                "detail",
-                ""
-            )
-        ).lower()
-
-        is_red = (
-            "red" in event_type
-            or "red" in detail
+        team_id = event.get(
+            "team_id"
         )
 
-        if not is_red:
+        if event_type != "redcard":
+
             continue
-
-        team_id = (
-            event.get(
-                "team_id"
-            )
-            or event.get(
-                "team",
-                {}
-            ).get("id")
-        )
 
         if team_id == home_id:
 
@@ -691,14 +636,17 @@ def count_red_cards(
 
             away_red += 1
 
-    return home_red, away_red
+    return (
+        home_red,
+        away_red
+    )
 
 
 # =========================================================
 # MOMENTUM
 # =========================================================
 
-def get_recent_momentum(
+def calculate_momentum(
     momentum_data,
     minute
 ):
@@ -738,20 +686,25 @@ def get_recent_momentum(
             <= minute
         ):
 
-            recent.append(value)
+            recent.append(
+                value
+            )
 
     if not recent:
 
         return 0.0
 
-    return sum(recent) / len(recent)
+    return (
+        sum(recent)
+        / len(recent)
+    )
 
 
 # =========================================================
 # LIVE INTENSITY
 # =========================================================
 
-def calculate_live_intensity(
+def calculate_intensity(
     home_xg,
     away_xg,
     minute,
@@ -773,17 +726,16 @@ def calculate_live_intensity(
         90 - elapsed
     )
 
-    # -----------------------------------------------------
-    # Базовая скорость xG
-    # -----------------------------------------------------
+    # xG в минуту
+    home_rate = (
+        home_xg / elapsed
+    )
 
-    home_rate = home_xg / elapsed
-    away_rate = away_xg / elapsed
+    away_rate = (
+        away_xg / elapsed
+    )
 
-    # -----------------------------------------------------
-    # Прогноз xG до конца
-    # -----------------------------------------------------
-
+    # Ожидаемый xG до конца
     lambda_home = (
         home_rate
         * remaining
@@ -794,24 +746,14 @@ def calculate_live_intensity(
         * remaining
     )
 
-    # -----------------------------------------------------
-    # Если xG пока очень маленький,
-    # не создаём искусственный сильный сигнал.
-    # -----------------------------------------------------
-
-    if home_xg < 0.20:
-
-        lambda_home *= 0.65
-
-    if away_xg < 0.20:
-
-        lambda_away *= 0.65
-
-    # -----------------------------------------------------
-    # Счёт
-    # -----------------------------------------------------
+    # =====================================================
+    # СЧЁТ
+    # =====================================================
 
     if score_diff < 0:
+
+        # Проигрывающая команда
+        # становится агрессивнее.
 
         lambda_home *= 1.15
         lambda_away *= 0.90
@@ -821,9 +763,9 @@ def calculate_live_intensity(
         lambda_home *= 0.90
         lambda_away *= 1.15
 
-    # -----------------------------------------------------
-    # Красная карточка
-    # -----------------------------------------------------
+    # =====================================================
+    # КРАСНЫЕ
+    # =====================================================
 
     lambda_home *= (
         0.75 ** red_home
@@ -833,13 +775,26 @@ def calculate_live_intensity(
         0.75 ** red_away
     )
 
+    # =====================================================
+    # ЕСЛИ xG ОЧЕНЬ МАЛЕНЬКИЙ
+    # НЕ СОЗДАЁМ ФИКТИВНУЮ АТАКУ
+    # =====================================================
+
+    if home_xg < 0.20:
+
+        lambda_home *= 0.65
+
+    if away_xg < 0.20:
+
+        lambda_away *= 0.65
+
     return (
         max(
-            0.01,
+            0.001,
             lambda_home
         ),
         max(
-            0.01,
+            0.001,
             lambda_away
         )
     )
@@ -873,17 +828,14 @@ def next_goal_probability(
         / total
     )
 
-    return {
-        "HOME_NEXT":
-            home_probability,
-
-        "AWAY_NEXT":
-            away_probability
-    }
+    return (
+        home_probability,
+        away_probability
+    )
 
 
 # =========================================================
-# АНАЛИЗ
+# АНАЛИЗ МАТЧА
 # =========================================================
 
 def analyze_match(
@@ -897,42 +849,38 @@ def analyze_match(
     if not match:
 
         return {
-            "decision": "ПРОПУСК",
-            "text": "⚪ ПРОПУСК\n\nМатч не найден."
+            "signal": False,
+            "text":
+                "⚪ <b>ПРОПУСК</b>\n\n"
+                "Не удалось получить матч."
         }
 
-    home_id = (
-        match.get(
-            "home_team",
-            {}
-        ).get("id")
+    home_team = match.get(
+        "home_team",
+        {}
     )
 
-    away_id = (
-        match.get(
-            "away_team",
-            {}
-        ).get("id")
+    away_team = match.get(
+        "away_team",
+        {}
     )
 
-    home = (
-        match.get(
-            "home_team",
-            {}
-        ).get(
-            "name",
-            "Хозяева"
-        )
+    home_id = home_team.get(
+        "id"
     )
 
-    away = (
-        match.get(
-            "away_team",
-            {}
-        ).get(
-            "name",
-            "Гости"
-        )
+    away_id = away_team.get(
+        "id"
+    )
+
+    home = home_team.get(
+        "name",
+        "Хозяева"
+    )
+
+    away = away_team.get(
+        "name",
+        "Гости"
     )
 
     score_home = int(
@@ -951,98 +899,78 @@ def analyze_match(
         )
     )
 
-    # -----------------------------------------------------
-    # LIVE МИНУТА
-    # -----------------------------------------------------
+    minute = get_match_minute(
+        match
+    )
 
-    today_matches = get_live_matches()
-
-    minute = 0
-
-    for m in today_matches:
-
-        if m.get("id") == match_id:
-
-            minute = get_minute(m)
-
-            break
-
-    # -----------------------------------------------------
-    # ВНЕ ДИАПАЗОНА
-    # -----------------------------------------------------
+    # =====================================================
+    # ВРЕМЕННОЙ ФИЛЬТР
+    # =====================================================
 
     if minute < MIN_MINUTE:
 
         return {
-            "decision": "ПРОПУСК",
+            "signal": False,
 
             "text":
-                f"⚽ {home} — {away}\n\n"
+                f"⚽ <b>{home} — {away}</b>\n\n"
                 f"⏱ {minute}′\n"
-                f"📊 Счёт: "
-                f"{score_home}:{score_away}\n\n"
-                "⚪ ПРОПУСК\n\n"
-                "Слишком рано для LIVE-сигнала."
+                f"📊 {score_home}:{score_away}\n\n"
+                "⚪ <b>ПРОПУСК</b>\n\n"
+                "Первые 5 минут."
         }
 
     if minute > MAX_MINUTE:
 
         return {
-            "decision": "ПРОПУСК",
+            "signal": False,
 
             "text":
-                f"⚽ {home} — {away}\n\n"
+                f"⚽ <b>{home} — {away}</b>\n\n"
                 f"⏱ {minute}′\n"
-                f"📊 Счёт: "
-                f"{score_home}:{score_away}\n\n"
-                "⚪ ПРОПУСК\n\n"
-                "Слишком поздно для входа."
+                f"📊 {score_home}:{score_away}\n\n"
+                "⚪ <b>ПРОПУСК</b>\n\n"
+                "Поздняя стадия матча."
         }
 
-    # -----------------------------------------------------
+    # =====================================================
     # ДАННЫЕ
-    # -----------------------------------------------------
+    # =====================================================
 
-    shots_data = get_match_shots(
+    shots_data = get_shots(
         match_id
     )
 
-    events_data = get_match_events(
+    events_data = get_events(
         match_id
     )
 
-    momentum_data = get_match_momentum(
+    momentum_data = get_momentum(
         match_id
     )
 
-    stats_data = get_match_stats(
-        match_id
-    )
-
-    shot_stats = calculate_shot_stats(
+    shot_stats = calculate_shots(
         shots_data,
         home_id,
         away_id
     )
 
-    stats = parse_stats(
-        stats_data
+    red_home, red_away = (
+        count_red_cards(
+            events_data,
+            home_id,
+            away_id
+        )
     )
 
-    red_home, red_away = count_red_cards(
-        events_data,
-        home_id,
-        away_id
-    )
-
-    momentum = get_recent_momentum(
+    momentum = calculate_momentum(
         momentum_data,
         minute
     )
 
-    # -----------------------------------------------------
-    # ОСНОВНЫЕ ПОКАЗАТЕЛИ
-    # -----------------------------------------------------
+    # =====================================================
+    # СТАТИСТИКА
+    # =====================================================
 
     home_shots = shot_stats[
         "home_shots"
@@ -1091,14 +1019,9 @@ def analyze_match(
         + away_xg
     )
 
-    total_xgot = (
-        home_xgot
-        + away_xgot
-    )
-
-    # -----------------------------------------------------
-    # INTENSITY
-    # -----------------------------------------------------
+    # =====================================================
+    # ИНТЕНСИВНОСТЬ
+    # =====================================================
 
     score_diff = (
         score_home
@@ -1106,7 +1029,7 @@ def analyze_match(
     )
 
     lambda_home, lambda_away = (
-        calculate_live_intensity(
+        calculate_intensity(
             home_xg,
             away_xg,
             minute,
@@ -1116,46 +1039,43 @@ def analyze_match(
         )
     )
 
-    probs = next_goal_probability(
-        lambda_home,
-        lambda_away
+    probabilities = (
+        next_goal_probability(
+            lambda_home,
+            lambda_away
+        )
     )
 
-    if not probs:
+    if not probabilities:
 
         return {
-            "decision": "ПРОПУСК",
+            "signal": False,
 
             "text":
-                f"⚽ {home} — {away}\n\n"
-                "⚪ ПРОПУСК\n\n"
+                f"⚽ <b>{home} — {away}</b>\n\n"
+                "⚪ <b>ПРОПУСК</b>\n\n"
                 "Недостаточно данных."
         }
 
-    home_prob = probs[
-        "HOME_NEXT"
-    ]
+    home_probability = probabilities[0]
+    away_probability = probabilities[1]
 
-    away_prob = probs[
-        "AWAY_NEXT"
-    ]
+    # =====================================================
+    # НАПРАВЛЕНИЕ
+    # =====================================================
 
-    # -----------------------------------------------------
-    # КТО ИМЕЕТ ПРЕИМУЩЕСТВО
-    # -----------------------------------------------------
-
-    if home_prob >= away_prob:
+    if home_probability >= away_probability:
 
         next_team = home
-        probability = home_prob
-        opponent_probability = away_prob
+        probability = home_probability
+        opponent_probability = away_probability
         direction = "HOME"
 
     else:
 
         next_team = away
-        probability = away_prob
-        opponent_probability = home_prob
+        probability = away_probability
+        opponent_probability = home_probability
         direction = "AWAY"
 
     advantage = (
@@ -1163,125 +1083,99 @@ def analyze_match(
         - opponent_probability
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # ФИЛЬТРЫ
-    # -----------------------------------------------------
+    # =====================================================
 
-    filters = 0
-    reasons = []
+    filters = []
 
+    # 1. xG
     if total_xg >= MIN_XG:
 
-        filters += 1
-
-    else:
-
-        reasons.append(
-            f"xG {total_xg:.2f}"
+        filters.append(
+            "xG"
         )
 
-    if total_target >= MIN_ON_TARGET:
-
-        filters += 1
-
-    else:
-
-        reasons.append(
-            f"в створ {total_target}"
-        )
-
+    # 2. Удары
     if total_shots >= MIN_SHOTS:
 
-        filters += 1
-
-    else:
-
-        reasons.append(
-            f"удары {total_shots}"
+        filters.append(
+            "Удары"
         )
 
+    # 3. Удары в створ
+    if total_target >= MIN_ON_TARGET:
+
+        filters.append(
+            "В створ"
+        )
+
+    # 4. Вероятность
     if probability >= MIN_PROBABILITY:
 
-        filters += 1
-
-    else:
-
-        reasons.append(
-            f"вероятность "
-            f"{probability * 100:.1f}%"
+        filters.append(
+            "Вероятность"
         )
 
+    # 5. Перевес
     if advantage >= MIN_ADVANTAGE:
 
-        filters += 1
-
-    else:
-
-        reasons.append(
-            f"перевес "
-            f"{advantage * 100:.1f}%"
+        filters.append(
+            "Перевес"
         )
 
-    # -----------------------------------------------------
+    # =====================================================
     # MOMENTUM
-    # -----------------------------------------------------
+    # =====================================================
 
     momentum_support = False
 
-    if direction == "HOME" and momentum > 0.10:
+    if direction == "HOME":
 
-        momentum_support = True
+        if momentum >= 5:
 
-    if direction == "AWAY" and momentum < -0.10:
-
-        momentum_support = True
-
-    # -----------------------------------------------------
-    # ФИНАЛЬНОЕ РЕШЕНИЕ
-    # -----------------------------------------------------
-
-    signal = (
-        filters >= 4
-        and momentum_support
-        and probability >= MIN_PROBABILITY
-        and advantage >= MIN_ADVANTAGE
-    )
-
-    if signal:
-
-        decision = "🟢 СИГНАЛ"
-
-        state["signals"] += 1
+            momentum_support = True
 
     else:
 
-        decision = "⚪ ПРОПУСК"
+        if momentum <= -5:
 
-    state["scans"] += 1
+            momentum_support = True
 
-    # -----------------------------------------------------
-    # ТЕКСТ
-    # -----------------------------------------------------
+    # =====================================================
+    # ФИНАЛ
+    # =====================================================
 
-    momentum_text = (
-        f"{momentum:+.2f}"
+    signal = (
+        len(filters) >= MIN_FILTERS
+        and probability >= MIN_PROBABILITY
+        and advantage >= MIN_ADVANTAGE
+        and momentum_support
     )
+
+    # =====================================================
+    # ТЕКСТ СИГНАЛА
+    # =====================================================
 
     if signal:
 
-        signal_text = (
+        state["signals"] += 1
+
+        text = (
 
             f"🟢 <b>LIVE SIGNAL</b>\n\n"
 
             f"⚽ <b>{home} — {away}</b>\n"
+
             f"⏱ {minute}′\n"
+
             f"📊 Счёт: "
             f"{score_home}:{score_away}\n\n"
 
-            f"🎯 Следующий гол: "
-            f"<b>{next_team}</b>\n\n"
+            f"⚽ <b>Следующий гол — "
+            f"{next_team}</b>\n\n"
 
-            f"📈 Наша вероятность: "
+            f"📈 Вероятность: "
             f"<b>{probability * 100:.1f}%</b>\n"
 
             f"⚖️ Перевес: "
@@ -1304,35 +1198,31 @@ def analyze_match(
             f"{away_target}\n\n"
 
             f"📈 Momentum: "
-            f"{momentum_text}\n"
+            f"{momentum:+.1f}\n"
 
             f"🟥 Красные: "
             f"{red_home} — "
             f"{red_away}\n\n"
 
             f"🔥 Фильтры: "
-            f"{filters}/5\n\n"
+            f"<b>{len(filters)}/5</b>\n\n"
 
-            f"⚠️ Это статистический сигнал, "
-            f"не гарантия результата."
+            "⚠️ Статистический сигнал, "
+            "не гарантия результата."
         )
 
     else:
 
-        reason_text = ", ".join(
-            reasons[:3]
-        )
-
-        signal_text = (
+        text = (
 
             f"⚽ <b>{home} — {away}</b>\n\n"
 
-            f"⏱ Минута: {minute}′\n"
+            f"⏱ {minute}′\n"
 
             f"📊 Счёт: "
             f"{score_home}:{score_away}\n\n"
 
-            f"📈 xG: "
+            f"📊 xG: "
             f"{home_xg:.2f} — "
             f"{away_xg:.2f}\n"
 
@@ -1358,19 +1248,19 @@ def analyze_match(
             f"{advantage * 100:.1f}%\n"
 
             f"📈 Momentum: "
-            f"{momentum_text}\n\n"
+            f"{momentum:+.1f}\n\n"
 
             f"🔥 Фильтры: "
-            f"{filters}/5\n\n"
+            f"{len(filters)}/5\n\n"
 
-            f"⚪ <b>ПРОПУСК</b>\n"
-
-            f"{reason_text}"
+            "⚪ <b>ПРОПУСК</b>"
         )
 
+    state["scans"] += 1
+
     return {
-        "decision": decision,
-        "text": signal_text
+        "signal": signal,
+        "text": text
     }
 
 
@@ -1421,8 +1311,8 @@ def live_keyboard(matches):
         )
 
         minute = match.get(
-            "_minute_estimate",
-            "?"
+            "_minute",
+            0
         )
 
         buttons.append(
@@ -1461,48 +1351,14 @@ def live_keyboard(matches):
 
 
 # =========================================================
-# АНАЛИЗ МАТЧА
-# =========================================================
-
-def handle_match(
-    chat_id,
-    match_id
-):
-
-    try:
-
-        result = analyze_match(
-            match_id
-        )
-
-        send_message(
-            chat_id,
-            result["text"],
-            match_keyboard(
-                match_id
-            )
-        )
-
-    except Exception as e:
-
-        print(
-            "MATCH ERROR:",
-            type(e).__name__,
-            str(e)
-        )
-
-        send_message(
-            chat_id,
-            "⚠️ Ошибка получения LIVE-данных.\n\n"
-            "Попробуй обновить анализ через 30–60 секунд."
-        )
-
-
-# =========================================================
-# TELEGRAM UPDATE
+# ОБРАБОТКА TELEGRAM
 # =========================================================
 
 def process_update(update):
+
+    # =====================================================
+    # MESSAGE
+    # =====================================================
 
     if "message" in update:
 
@@ -1516,367 +1372,68 @@ def process_update(update):
             "id"
         ]
 
+        subscribers.add(
+            chat_id
+        )
+
         text = message.get(
             "text",
             ""
-        )
+        ).strip()
 
         if text == "/start":
 
             send_message(
+
                 chat_id,
 
-                "⚽ <b>FOOTBALL LIVE 2.0</b>\n\n"
-                "LIVE-анализ следующего гола.\n\n"
+                "⚽ <b>FOOTBALL LIVE</b>\n\n"
+                "Live-анализ следующего гола.\n\n"
+                "Бот автоматически проверяет "
+                "live-матчи и ищет сильные сигналы.\n\n"
                 "Выбери раздел:",
 
                 main_keyboard()
             )
 
-    if "callback_query" in update:
+            return
 
-        query = update[
-            "callback_query"
-        ]
-
-        callback_id = query[
-            "id"
-        ]
-
-        chat_id = query[
-            "message"
-        ][
-            "chat"
-        ][
-            "id"
-        ]
-
-        data = query.get(
-            "data",
-            ""
-        )
-
-        answer_callback(
-            callback_id
-        )
-
-        # -------------------------------------------------
-        # HOME
-        # -------------------------------------------------
-
-        if data == "home":
+        if text == "/status":
 
             send_message(
+
                 chat_id,
 
-                "⚽ <b>FOOTBALL LIVE 2.0</b>\n\n"
-                "Выбери раздел:",
-
-                main_keyboard()
-            )
-
-        # -------------------------------------------------
-        # LIVE
-        # -------------------------------------------------
-
-        elif data == "live":
-
-            try:
-
-                matches = get_live_matches()
-
-                if not matches:
-
-                    send_message(
-                        chat_id,
-
-                        "🔴 <b>LIVE</b>\n\n"
-                        "Сейчас активных матчей "
-                        "не найдено.",
-
-                        main_keyboard()
-                    )
-
-                else:
-
-                    send_message(
-                        chat_id,
-
-                        f"🔴 <b>LIVE</b>\n\n"
-                        f"Найдено матчей: "
-                        f"{len(matches)}\n\n"
-                        "Выбери матч:",
-
-                        live_keyboard(
-                            matches
-                        )
-                    )
-
-            except Exception as e:
-
-                print(
-                    "LIVE ERROR:",
-                    type(e).__name__,
-                    str(e)
-                )
-
-                send_message(
-                    chat_id,
-                    "⚠️ Не удалось получить LIVE-матчи."
-                )
-
-        # -------------------------------------------------
-        # TODAY
-        # -------------------------------------------------
-
-        elif data == "today":
-
-            try:
-
-                matches = get_today_matches()
-
-                buttons = []
-
-                for match in matches[:30]:
-
-                    match_id = match.get(
-                        "id"
-                    )
-
-                    home = match.get(
-                        "home_team",
-                        {}
-                    ).get(
-                        "name",
-                        "?"
-                    )
-
-                    away = match.get(
-                        "away_team",
-                        {}
-                    ).get(
-                        "name",
-                        "?"
-                    )
-
-                    status = match.get(
-                        "status",
-                        "?"
-                    )
-
-                    buttons.append(
-
-                        [
-                            {
-                                "text":
-                                    f"{home} — "
-                                    f"{away} "
-                                    f"[{status}]",
-
-                                "callback_data":
-                                    f"match:{match_id}"
-                            }
-                        ]
-                    )
-
-                if not buttons:
-
-                    send_message(
-                        chat_id,
-                        "📅 Сегодня матчей не найдено."
-                    )
-
-                else:
-
-                    send_message(
-                        chat_id,
-
-                        f"📅 <b>МАТЧИ СЕГОДНЯ</b>\n\n"
-                        f"Найдено: "
-                        f"{len(matches)}\n\n"
-                        "Выбери матч:",
-
-                        {
-                            "inline_keyboard":
-                                buttons
-                        }
-                    )
-
-            except Exception as e:
-
-                print(
-                    "TODAY ERROR:",
-                    type(e).__name__,
-                    str(e)
-                )
-
-                send_message(
-                    chat_id,
-                    "⚠️ Не удалось получить матчи."
-                )
-
-        # -------------------------------------------------
-        # STATUS
-        # -------------------------------------------------
-
-        elif data == "status":
-
-            send_message(
-                chat_id,
-
-                f"📊 <b>СТАТУС БОТА</b>\n\n"
+                f"📊 <b>СТАТУС</b>\n\n"
                 f"🔎 Анализов: "
                 f"{state['scans']}\n"
                 f"🟢 Сигналов: "
                 f"{state['signals']}\n"
                 f"💰 Тестовый банк: "
-                f"{state['bankroll']:.2f}",
-
-                main_keyboard()
+                f"{state['bankroll']:.2f}"
             )
 
-        # -------------------------------------------------
-        # MATCH
-        # -------------------------------------------------
+            return
 
-        elif data.startswith(
-            "match:"
+        if text.startswith(
+            "/bank "
         ):
 
-            match_id = data.split(
-                ":",
-                1
-            )[1]
+            try:
 
-            handle_match(
-                chat_id,
-                match_id
-            )
-
-
-# =========================================================
-# MAIN LOOP
-# =========================================================
-
-def main():
-
-    offset = 0
-
-    print(
-        "FOOTBALL LIVE 2.0 STARTED"
-    )
-
-    while True:
-
-        try:
-
-            result = telegram(
-                "getUpdates",
-                {
-                    "timeout": 25,
-                    "offset": offset
-                }
-            )
-
-            for update in result.get(
-                "result",
-                []
-            ):
-
-                offset = (
-                    update[
-                        "update_id"
-                    ] + 1
+                amount = float(
+                    text.split(
+                        " ",
+                        1
+                    )[1]
                 )
 
-                try:
+                if amount <= 0:
 
-                    process_update(
-                        update
-                    )
+                    raise ValueError
 
-                except Exception as e:
+                state[
+                    "bankroll"
+                ] = amount
 
-                    print(
-                        "UPDATE ERROR:",
-                        type(e).__name__,
-                        str(e)
-                    )
-
-        except Exception as e:
-
-            print(
-                "MAIN ERROR:",
-                type(e).__name__,
-                str(e)
-            )
-
-            time.sleep(5)
-
-
-# =========================================================
-# RENDER HEALTH SERVER
-# =========================================================
-
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
-
-    def do_GET(self):
-
-        self.send_response(
-            200
-        )
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            b"Football Live 2.0 is running"
-        )
-
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-
-        return
-
-
-def start_web_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
-
-    server = HTTPServer(
-        (
-            "0.0.0.0",
-            port
-        ),
-        HealthHandler
-    )
-
-    server.serve_forever()
-
-
-# =========================================================
-# START
-# =========================================================
-
-if __name__ == "__main__":
-
-    threading.Thread(
-        target=start_web_server,
-        daemon=True
-    ).start()
-
-    main()
+                send_message
