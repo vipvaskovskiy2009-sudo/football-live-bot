@@ -420,9 +420,13 @@ def parse_stats(data):
                     result["home_xg"] = home
                     result["away_xg"] = away
 
-                elif key in ("total_shots", "shots"):
-                    result["home_shots"] = int(home)
-                    result["away_shots"] = int(away)
-
-                elif key in (
+                
+elif key in (
+    "shots_on_target",
+    "shots_on_goal",
+    "on_target"
+):
+    result["home_target"] = int(home)
+    result["away_target"] = int(away)
+                
                    
