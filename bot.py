@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -5,326 +6,401 @@ import threading
 import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-FOOTBALL_API_KEY = os.environ["FOOTBALL_API_KEY"]
+PITCH_KEY = os.environ["FOOTBALL_API_KEY"]
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-FOOTBALL_API = "https://v3.football.api-sports.io/"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+PITCH_API = "https://api.pitchapi.dev/v1"
 
-HEADERS = {
-    "x-apisports-key": FOOTBALL_API_KEY
-}
+TALLINN = ZoneInfo("Europe/Tallinn")
 
 
-def telegram(method, data=None):
-    url = TELEGRAM_API + method
+# =========================================================
+# HTTP
+# =========================================================
 
-    if data:
-        body = urllib.parse.urlencode(data).encode()
-        request = urllib.request.Request(url, data=body)
-    else:
-        request = urllib.request.Request(url)
+def api_get(url, headers=None, timeout=20):
+    req = urllib.request.Request(
+        url,
+        headers=headers or {},
+        method="GET"
+    )
 
-    with urllib.request.urlopen(request, timeout=25) as response:
-        return json.loads(response.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw)
+    except Exception as e:
+        print("HTTP ERROR:", url, e)
+        raise
 
 
-def football(endpoint, params=None):
-    url = FOOTBALL_API + endpoint
+def pitch_get(path, params=None):
+    url = PITCH_API + path
 
     if params:
         url += "?" + urllib.parse.urlencode(params)
 
-    request = urllib.request.Request(
+    data = api_get(
         url,
-        headers=HEADERS
+        headers={
+            "X-API-KEY": PITCH_KEY,
+            "Accept": "application/json",
+            "User-Agent": "FootballLiveBot/1.0"
+        }
     )
 
-    with urllib.request.urlopen(request, timeout=25) as response:
-        result = json.loads(response.read())
+    if "error" in data:
+        error = data["error"]
+        raise RuntimeError(
+            f"PitchAPI error: {error.get('code')} - {error.get('message')}"
+        )
 
-    if result.get("errors"):
-        print("FOOTBALL API ERROR:", result["errors"])
+    return data.get("data")
 
-    return result
+
+def telegram(method, payload=None):
+    url = f"{TELEGRAM_API}/{method}"
+
+    body = urllib.parse.urlencode(payload or {}).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def send_message(chat_id, text, keyboard=None):
-    data = {
+    payload = {
         "chat_id": chat_id,
-        "text": text
+        "text": text,
+        "parse_mode": "HTML"
     }
 
     if keyboard:
-        data["reply_markup"] = json.dumps(keyboard)
+        payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
-    telegram("sendMessage", data)
+    return telegram("sendMessage", payload)
 
 
 def answer_callback(callback_id):
     try:
         telegram(
             "answerCallbackQuery",
-            {
-                "callback_query_id": callback_id
-            }
+            {"callback_query_id": callback_id}
         )
     except Exception as e:
         print("CALLBACK ERROR:", e)
 
 
-def main_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "🔴 LIVE",
-                    "callback_data": "live"
-                }
-            ],
-            [
-                {
-                    "text": "📅 МАТЧИ СЕГОДНЯ",
-                    "callback_data": "today"
-                }
-            ]
-        ]
-    }
+# =========================================================
+# TELEGRAM MENU
+# =========================================================
+
+MAIN_KEYBOARD = {
+    "keyboard": [
+        [{"text": "🔴 LIVE"}],
+        [{"text": "📅 МАТЧИ СЕГОДНЯ"}]
+    ],
+    "resize_keyboard": True
+}
 
 
-def get_live_matches():
-    data = football(
-        "fixtures",
-        {
-            "live": "all"
-        }
+def start_text():
+    return (
+        "⚽ <b>FOOTBALL LIVE</b>\n\n"
+        "LIVE-анализ футбольных матчей.\n\n"
+        "Выбери раздел:"
     )
 
-    return data.get("response", [])
+
+# =========================================================
+# DATE / MATCHES
+# =========================================================
+
+def parse_time_utc(value):
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except Exception:
+        return None
 
 
 def get_today_matches():
-    today = datetime.now(
-        ZoneInfo("Europe/Tallinn")
-    ).strftime("%Y-%m-%d")
+    now = datetime.now(TALLINN)
+    date_str = now.strftime("%Y-%m-%d")
 
-    data = football(
-        "fixtures",
-        {
-            "date": today,
-            "timezone": "Europe/Tallinn"
-        }
+    data = pitch_get(
+        f"/date/{date_str}",
+        {"status": "all"}
     )
 
-    return data.get("response", [])
+    return data.get("matches", []) if data else []
 
 
-def live_keyboard(matches):
-    buttons = []
+def is_live_match(match):
+    status = str(match.get("status") or "").lower()
 
-    for match in matches[:30]:
-
-        fixture_id = match["fixture"]["id"]
-
-        minute = (
-            match["fixture"]["status"].get("elapsed")
-            or "?"
-        )
-
-        home = match["teams"]["home"]["name"]
-        away = match["teams"]["away"]["name"]
-
-        home_score = match["goals"]["home"]
-        away_score = match["goals"]["away"]
-
-        if home_score is None:
-            home_score = 0
-
-        if away_score is None:
-            away_score = 0
-
-        buttons.append(
-            [
-                {
-                    "text": (
-                        f"{minute}′ "
-                        f"{home} "
-                        f"{home_score}:{away_score} "
-                        f"{away}"
-                    ),
-                    "callback_data": f"match:{fixture_id}"
-                }
-            ]
-        )
-
-    if not buttons:
-        buttons.append(
-            [
-                {
-                    "text": "🔄 Обновить",
-                    "callback_data": "live"
-                }
-            ]
-        )
-
-    return {
-        "inline_keyboard": buttons
+    finished_statuses = {
+        "finished",
+        "ft",
+        "after_extra_time",
+        "after_penalties",
+        "cancelled",
+        "postponed",
+        "abandoned"
     }
 
-
-def today_keyboard(matches):
-    buttons = []
-
-    for match in matches[:30]:
-
-        fixture_id = match["fixture"]["id"]
-
-        home = match["teams"]["home"]["name"]
-        away = match["teams"]["away"]["name"]
-
-        status = match["fixture"]["status"]["short"]
-
-        buttons.append(
-            [
-                {
-                    "text": (
-                        f"{home} — {away} "
-                        f"[{status}]"
-                    ),
-                    "callback_data": f"match:{fixture_id}"
-                }
-            ]
-        )
-
-    if not buttons:
-        buttons.append(
-            [
-                {
-                    "text": "🔄 Обновить",
-                    "callback_data": "today"
-                }
-            ]
-        )
-
-    return {
-        "inline_keyboard": buttons
+    not_started_statuses = {
+        "not_started",
+        "scheduled",
+        "upcoming"
     }
 
+    if status in finished_statuses:
+        return False
 
-def get_match(fixture_id):
+    if status in not_started_statuses:
+        start = parse_time_utc(match.get("time_utc"))
 
-    data = football(
-        "fixtures",
-        {
-            "id": fixture_id
-        }
-    )
+        if not start:
+            return False
 
-    response = data.get("response", [])
+        now_utc = datetime.now(timezone.utc)
 
-    if not response:
-        return None
+        # Если начало уже прошло, считаем матч потенциально LIVE.
+        # Это позволяет работать и с задержками обновления статуса.
+        return start <= now_utc
 
-    return response[0]
+    # Для неизвестного статуса дополнительно смотрим время.
+    start = parse_time_utc(match.get("time_utc"))
 
+    if start:
+        return start <= datetime.now(timezone.utc)
 
-def get_match_stats(fixture_id):
-
-    data = football(
-        "fixtures/statistics",
-        {
-            "fixture": fixture_id
-        }
-    )
-
-    return data.get("response", [])
+    return False
 
 
-def stat_value(stats, name):
+def get_live_matches():
+    matches = get_today_matches()
 
-    for item in stats:
+    live = [
+        match for match in matches
+        if is_live_match(match)
+    ]
 
-        if item.get("type") != name:
-            continue
-
-        value = item.get("value")
-
-        if value is None:
-            return 0
-
-        if isinstance(value, str):
-
-            value = value.replace("%", "")
-
-            try:
-                return float(value)
-            except Exception:
-                return 0
-
-        return value
-
-    return 0
+    return live
 
 
-def team_stats_from_response(match, stats):
+# =========================================================
+# MATCH DATA
+# =========================================================
 
-    home_id = match["teams"]["home"]["id"]
-    away_id = match["teams"]["away"]["id"]
+def get_match(match_id):
+    return pitch_get(f"/matches/{match_id}")
 
-    home_stats = []
-    away_stats = []
 
-    for block in stats:
+def get_match_shots(match_id):
+    data = pitch_get(f"/matches/{match_id}/shots")
 
-        team = block.get("team", {})
-        team_id = team.get("id")
+    if not data:
+        return []
+
+    shots = []
+
+    for period in data.get("periods", []):
+        shots.extend(period.get("shots", []))
+
+    return shots
+
+
+def get_match_stats(match_id):
+    return pitch_get(f"/matches/{match_id}/stats")
+
+
+def get_match_events(match_id):
+    data = pitch_get(f"/matches/{match_id}/events")
+
+    if not data:
+        return []
+
+    return data.get("events", [])
+
+
+def get_match_momentum(match_id):
+    data = pitch_get(f"/matches/{match_id}/momentum")
+
+    if not data:
+        return []
+
+    return data.get("points", [])
+
+
+# =========================================================
+# STATISTICS
+# =========================================================
+
+def calculate_shot_stats(shots, home_id, away_id):
+    result = {
+        "home_shots": 0,
+        "away_shots": 0,
+        "home_on_target": 0,
+        "away_on_target": 0,
+        "home_xg": 0.0,
+        "away_xg": 0.0,
+        "home_xgot": 0.0,
+        "away_xgot": 0.0,
+        "home_box_shots": 0,
+        "away_box_shots": 0
+    }
+
+    for shot in shots:
+        team_id = shot.get("team_id")
+
+        xg = shot.get("expected_goals")
+        xgot = shot.get("expected_goals_on_target")
+
+        if not isinstance(xg, (int, float)):
+            xg = 0.0
+
+        if not isinstance(xgot, (int, float)):
+            xgot = 0.0
+
+        on_target = bool(shot.get("is_on_target"))
+        inside_box = bool(shot.get("is_inside_box"))
 
         if team_id == home_id:
-            home_stats = block.get(
-                "statistics",
-                []
-            )
+            result["home_shots"] += 1
+            result["home_xg"] += xg
+            result["home_xgot"] += xgot
+
+            if on_target:
+                result["home_on_target"] += 1
+
+            if inside_box:
+                result["home_box_shots"] += 1
 
         elif team_id == away_id:
-            away_stats = block.get(
-                "statistics",
-                []
-            )
+            result["away_shots"] += 1
+            result["away_xg"] += xg
+            result["away_xgot"] += xgot
 
-    if not home_stats and not away_stats:
+            if on_target:
+                result["away_on_target"] += 1
 
-        if len(stats) >= 2:
+            if inside_box:
+                result["away_box_shots"] += 1
 
-            home_stats = stats[0].get(
-                "statistics",
-                []
-            )
-
-            away_stats = stats[1].get(
-                "statistics",
-                []
-            )
-
-    return home_stats, away_stats
+    return result
 
 
-def analyze_match(match, stats):
+def extract_stats(stats_data):
+    result = {}
 
-    home = match["teams"]["home"]["name"]
-    away = match["teams"]["away"]["name"]
+    if not stats_data:
+        return result
 
-    minute = (
-        match["fixture"]["status"].get("elapsed")
-        or 0
-    )
+    periods = stats_data.get("periods", [])
 
-    score_home = match["goals"]["home"]
+    # Используем только полный матч.
+    period = None
 
-    score_away = match["goals"]["away"]
+    for p in periods:
+        if str(p.get("period", "")).lower() == "all":
+            period = p
+            break
+
+    if period is None and periods:
+        period = periods[-1]
+
+    if not period:
+        return result
+
+    for group in period.get("groups", []):
+        for item in group.get("items", []):
+            key = item.get("key")
+
+            if not key:
+                continue
+
+            home = item.get("home")
+            away = item.get("away")
+
+            result[key] = {
+                "home": home,
+                "away": away,
+                "title": item.get("title")
+            }
+
+    return result
+
+
+def to_number(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    # "63%" -> 63
+    if "%" in text:
+        text = text.replace("%", "").strip()
+
+    # "4 / 10" -> 4
+    if " " in text:
+        text = text.split(" ")[0]
+
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def stat_value(stats, key, side):
+    item = stats.get(key)
+
+    if not item:
+        return None
+
+    return to_number(item.get(side))
+
+
+# =========================================================
+# ANALYSIS
+# =========================================================
+
+def analyze_match(match_id):
+    match = get_match(match_id)
+
+    home = match.get("home_team", {})
+    away = match.get("away_team", {})
+
+    home_id = home.get("id")
+    away_id = away.get("id")
+
+    home_name = home.get("name", "HOME")
+    away_name = away.get("name", "AWAY")
+
+    score_home = match.get("score_home")
+    score_away = match.get("score_away")
 
     if score_home is None:
         score_home = 0
@@ -332,452 +408,461 @@ def analyze_match(match, stats):
     if score_away is None:
         score_away = 0
 
-    if not stats:
+    shots = get_match_shots(match_id)
+    stats_data = get_match_stats(match_id)
+    events = get_match_events(match_id)
+    momentum = get_match_momentum(match_id)
 
-        return (
-            f"⚽ {home} — {away}\n\n"
-            f"⏱ {minute}′\n"
-            f"📊 Счёт: {score_home}:{score_away}\n\n"
-            "⚪ ПРОПУСК\n\n"
-            "API пока не вернул LIVE-статистику.\n"
-            "Попробуй обновить через 30–60 секунд."
+    shot_stats = calculate_shot_stats(
+        shots,
+        home_id,
+        away_id
+    )
+
+    stats = extract_stats(stats_data)
+
+    # -----------------------------------------------------
+    # Basic statistics
+    # -----------------------------------------------------
+
+    possession_home = stat_value(
+        stats, "possession", "home"
+    )
+
+    possession_away = stat_value(
+        stats, "possession", "away"
+    )
+
+    dangerous_home = stat_value(
+        stats, "dangerous_attacks", "home"
+    )
+
+    dangerous_away = stat_value(
+        stats, "dangerous_attacks", "away"
+    )
+
+    attacks_home = stat_value(
+        stats, "attacks", "home"
+    )
+
+    attacks_away = stat_value(
+        stats, "attacks", "away"
+    )
+
+    corners_home = stat_value(
+        stats, "corners", "home"
+    )
+
+    corners_away = stat_value(
+        stats, "corners", "away"
+    )
+
+    # Some feeds use slightly different names.
+    if possession_home is None:
+        possession_home = stat_value(
+            stats, "ball_possession", "home"
         )
 
-    home_stats, away_stats = team_stats_from_response(
-        match,
-        stats
-    )
-
-    if not home_stats and not away_stats:
-
-        return (
-            f"⚽ {home} — {away}\n\n"
-            f"⏱ {minute}′\n"
-            f"📊 Счёт: {score_home}:{score_away}\n\n"
-            "⚪ ПРОПУСК\n\n"
-            "LIVE-матч найден, но статистика "
-            "пока недоступна."
+    if possession_away is None:
+        possession_away = stat_value(
+            stats, "ball_possession", "away"
         )
 
-    home_shots = stat_value(
-        home_stats,
-        "Total Shots"
+    # -----------------------------------------------------
+    # Momentum
+    # -----------------------------------------------------
+
+    momentum_value = None
+
+    if momentum:
+        last = momentum[-1]
+        momentum_value = last.get("value")
+
+    # -----------------------------------------------------
+    # Model
+    # -----------------------------------------------------
+
+    total_xg = (
+        shot_stats["home_xg"] +
+        shot_stats["away_xg"]
     )
 
-    away_shots = stat_value(
-        away_stats,
-        "Total Shots"
+    total_xgot = (
+        shot_stats["home_xgot"] +
+        shot_stats["away_xgot"]
     )
 
-    home_target = stat_value(
-        home_stats,
-        "Shots on Goal"
-    )
-
-    away_target = stat_value(
-        away_stats,
-        "Shots on Goal"
-    )
-
-    home_corners = stat_value(
-        home_stats,
-        "Corner Kicks"
-    )
-
-    away_corners = stat_value(
-        away_stats,
-        "Corner Kicks"
-    )
-
-    home_possession = stat_value(
-        home_stats,
-        "Ball Possession"
-    )
-
-    away_possession = stat_value(
-        away_stats,
-        "Ball Possession"
+    total_on_target = (
+        shot_stats["home_on_target"] +
+        shot_stats["away_on_target"]
     )
 
     total_shots = (
-        home_shots + away_shots
+        shot_stats["home_shots"] +
+        shot_stats["away_shots"]
     )
 
-    total_target = (
-        home_target + away_target
+    score_total = score_home + score_away
+
+    remaining_xg = max(0.0, total_xg - score_total)
+
+    signal = "ПРОПУСК"
+    reason = "Недостаточно сильного LIVE-сигнала."
+
+    # Технический фильтр.
+    # Это не прогноз гарантированного результата.
+    strong_attack = (
+        total_xg >= 2.2 and
+        total_on_target >= 5 and
+        total_shots >= 12
     )
 
-    total_corners = (
-        home_corners + away_corners
-    )
+    strong_quality = total_xgot >= 1.8
 
-    signals = 0
+    balanced_flow = True
 
-    if total_shots >= 14:
-        signals += 1
+    if momentum_value is not None:
+        balanced_flow = abs(float(momentum_value)) <= 75
 
-    if total_target >= 5:
-        signals += 1
-
-    if total_corners >= 4:
-        signals += 1
-
-    if total_shots >= 18 and total_target >= 7:
-        signals += 1
-
-    if minute >= 25 and total_target >= 4:
-        signals += 1
-
-    if signals >= 4:
-        decision = "🟢 СИГНАЛ"
-    else:
-        decision = "⚪ ПРОПУСК"
-
-    return (
-        f"⚽ {home} — {away}\n\n"
-        f"⏱ Минута: {minute}′\n"
-        f"📊 Счёт: {score_home}:{score_away}\n\n"
-
-        f"🥅 Удары: "
-        f"{home_shots:.0f} — "
-        f"{away_shots:.0f}\n"
-
-        f"🎯 В створ: "
-        f"{home_target:.0f} — "
-        f"{away_target:.0f}\n"
-
-        f"🚩 Угловые: "
-        f"{home_corners:.0f} — "
-        f"{away_corners:.0f}\n"
-
-        f"⚽ Всего ударов: "
-        f"{total_shots:.0f}\n"
-
-        f"🎯 Всего в створ: "
-        f"{total_target:.0f}\n"
-
-        f"🚩 Всего угловых: "
-        f"{total_corners:.0f}\n\n"
-
-        f"Владение: "
-        f"{home_possession:.0f}% — "
-        f"{away_possession:.0f}%\n\n"
-
-        f"🔎 Активных сигналов: "
-        f"{signals}/5\n\n"
-
-        f"{decision}\n\n"
-
-        "⚠️ Статистический сигнал "
-        "для тестирования, не гарантия результата."
-    )
-
-
-def handle_match(chat_id, fixture_id):
-
-    try:
-
-        match = get_match(fixture_id)
-
-        if not match:
-
-            send_message(
-                chat_id,
-                "⚪ ПРОПУСК\n\n"
-                "Матч не найден."
-            )
-
-            return
-
-        stats = get_match_stats(
-            fixture_id
+    if strong_attack and strong_quality and balanced_flow:
+        signal = "СИГНАЛ"
+        reason = (
+            "LIVE-поток имеет достаточный объём моментов "
+            "и качество ударов."
         )
 
-        result = analyze_match(
-            match,
-            stats
+    # -----------------------------------------------------
+    # Text
+    # -----------------------------------------------------
+
+    text = (
+        f"⚽ <b>{home_name} — {away_name}</b>\n\n"
+        f"⏱ Статус: <b>{match.get('status', 'LIVE')}</b>\n"
+        f"🔢 Счёт: <b>{int(score_home)}:{int(score_away)}</b>\n\n"
+
+        f"🟢 <b>КАЧЕСТВО МОМЕНТОВ</b>\n"
+        f"xG: {shot_stats['home_xg']:.2f} — "
+        f"{shot_stats['away_xg']:.2f}\n"
+        f"xGOT: {shot_stats['home_xgot']:.2f} — "
+        f"{shot_stats['away_xgot']:.2f}\n"
+        f"Удары в створ: "
+        f"{shot_stats['home_on_target']} — "
+        f"{shot_stats['away_on_target']}\n"
+        f"Удары из штрафной: "
+        f"{shot_stats['home_box_shots']} — "
+        f"{shot_stats['away_box_shots']}\n\n"
+
+        f"🟢 <b>ТЕМП</b>\n"
+        f"Удары: "
+        f"{shot_stats['home_shots']} — "
+        f"{shot_stats['away_shots']}\n"
+    )
+
+    if dangerous_home is not None and dangerous_away is not None:
+        text += (
+            f"Опасные атаки: "
+            f"{dangerous_home:.0f} — "
+            f"{dangerous_away:.0f}\n"
         )
 
-        send_message(
-            chat_id,
-            result,
+    if attacks_home is not None and attacks_away is not None:
+        text += (
+            f"Атаки: "
+            f"{attacks_home:.0f} — "
+            f"{attacks_away:.0f}\n"
+        )
+
+    if possession_home is not None and possession_away is not None:
+        text += (
+            f"Владение: "
+            f"{possession_home:.0f}% — "
+            f"{possession_away:.0f}%\n"
+        )
+
+    if corners_home is not None and corners_away is not None:
+        text += (
+            f"Угловые: "
+            f"{corners_home:.0f} — "
+            f"{corners_away:.0f}\n"
+        )
+
+    text += (
+        f"\n📊 Всего ударов: <b>{total_shots}</b>\n"
+        f"🎯 Удары в створ: <b>{total_on_target}</b>\n"
+        f"📈 Сумма xG: <b>{total_xg:.2f}</b>\n"
+        f"📈 Сумма xGOT: <b>{total_xgot:.2f}</b>\n"
+    )
+
+    if momentum_value is not None:
+        text += (
+            f"🌊 Momentum: <b>{float(momentum_value):.1f}</b>\n"
+        )
+
+    text += (
+        f"\n<b>{signal}</b>\n"
+        f"{reason}\n\n"
+        f"⚠️ Модельный сигнал, не гарантия результата."
+    )
+
+    return text
+
+
+# =========================================================
+# MATCH BUTTONS
+# =========================================================
+
+def live_keyboard(matches):
+    rows = []
+
+    for match in matches[:30]:
+        match_id = match.get("id")
+
+        home = match.get("home_team", {}).get(
+            "name", "HOME"
+        )
+
+        away = match.get("away_team", {}).get(
+            "name", "AWAY"
+        )
+
+        score_home = match.get("score_home")
+        score_away = match.get("score_away")
+
+        if score_home is None:
+            score_home = 0
+
+        if score_away is None:
+            score_away = 0
+
+        label = (
+            f"⚽ {home} "
+            f"{score_home}:{score_away} "
+            f"{away}"
+        )
+
+        rows.append([
             {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": "🔄 Обновить анализ",
-                            "callback_data":
-                                f"match:{fixture_id}"
-                        }
-                    ],
-                    [
-                        {
-                            "text": "🔴 LIVE",
-                            "callback_data": "live"
-                        }
-                    ],
-                    [
-                        {
-                            "text": "🏠 Главное меню",
-                            "callback_data": "home"
-                        }
-                    ]
-                ]
+                "text": label[:60],
+                "callback_data": f"match:{match_id}"
             }
+        ])
+
+    return {
+        "inline_keyboard": rows
+    }
+
+
+def today_text(matches):
+    if not matches:
+        return "📅 <b>МАТЧИ СЕГОДНЯ</b>\n\nМатчей не найдено."
+
+    text = "📅 <b>МАТЧИ СЕГОДНЯ</b>\n\n"
+
+    for match in matches[:30]:
+        home = match.get("home_team", {}).get(
+            "name", "HOME"
         )
 
-    except Exception as e:
-
-        print(
-            "MATCH ANALYSIS ERROR:",
-            type(e).__name__,
-            str(e)
+        away = match.get("away_team", {}).get(
+            "name", "AWAY"
         )
 
-        send_message(
-            chat_id,
-            "⚠️ Ошибка получения LIVE-данных.\n\n"
-            "Подробность записана в Render Logs."
+        status = match.get("status", "")
+
+        text += (
+            f"⚽ {home} — {away}\n"
+            f"Статус: {status}\n\n"
         )
 
+    return text
+
+
+# =========================================================
+# UPDATE HANDLING
+# =========================================================
 
 def process_update(update):
+    try:
+        # Normal message
+        message = update.get("message")
 
-    if "message" in update:
+        if message:
+            chat_id = message["chat"]["id"]
+            text = message.get("text", "")
 
-        message = update["message"]
-
-        chat_id = message["chat"]["id"]
-
-        text = message.get(
-            "text",
-            ""
-        )
-
-        if text == "/start":
-
-            send_message(
-                chat_id,
-                "⚽ FOOTBALL LIVE\n\n"
-                "LIVE-анализ футбольных матчей.\n\n"
-                "Выбери раздел:",
-                main_keyboard()
-            )
-
-    if "callback_query" in update:
-
-        query = update["callback_query"]
-
-        callback_id = query["id"]
-
-        chat_id = query["message"]["chat"]["id"]
-
-        data = query.get(
-            "data",
-            ""
-        )
-
-        answer_callback(
-            callback_id
-        )
-
-        if data == "home":
-
-            send_message(
-                chat_id,
-                "⚽ FOOTBALL LIVE\n\n"
-                "Выбери раздел:",
-                main_keyboard()
-            )
-
-        elif data == "live":
-
-            try:
-
-                matches = get_live_matches()
-
-                if not matches:
-
-                    send_message(
-                        chat_id,
-                        "🔴 LIVE\n\n"
-                        "Сейчас активных матчей "
-                        "не найдено.",
-                        main_keyboard()
-                    )
-
-                else:
-
-                    send_message(
-                        chat_id,
-                        f"🔴 LIVE\n\n"
-                        f"Найдено матчей: "
-                        f"{len(matches)}\n\n"
-                        "Выбери матч:",
-                        live_keyboard(matches)
-                    )
-
-            except Exception as e:
-
-                print(
-                    "LIVE ERROR:",
-                    type(e).__name__,
-                    str(e)
-                )
-
+            if text == "/start":
                 send_message(
                     chat_id,
-                    "⚠️ Не удалось получить LIVE-матчи."
+                    start_text(),
+                    MAIN_KEYBOARD
                 )
+                return
 
-        elif data == "today":
-
-            try:
-
-                matches = get_today_matches()
-
-                if not matches:
-
-                    send_message(
-                        chat_id,
-                        "📅 Сегодня матчей не найдено."
-                    )
-
-                else:
-
-                    send_message(
-                        chat_id,
-                        f"📅 МАТЧИ СЕГОДНЯ\n\n"
-                        f"Найдено: {len(matches)}\n\n"
-                        "Выбери матч:",
-                        today_keyboard(matches)
-                    )
-
-            except Exception as e:
-
-                print(
-                    "TODAY ERROR:",
-                    type(e).__name__,
-                    str(e)
-                )
-
-                send_message(
-                    chat_id,
-                    "⚠️ Не удалось получить матчи."
-                )
-
-        elif data.startswith("match:"):
-
-            fixture_id = data.split(
-                ":",
-                1
-            )[1]
-
-            handle_match(
-                chat_id,
-                fixture_id
-            )
-
-
-def main():
-
-    offset = 0
-
-    while True:
-
-        try:
-
-            result = telegram(
-                "getUpdates",
-                {
-                    "timeout": 25,
-                    "offset": offset
-                }
-            )
-
-            for update in result.get(
-                "result",
-                []
-            ):
-
-                offset = (
-                    update["update_id"] + 1
-                )
-
+            if text == "🔴 LIVE":
                 try:
+                    matches = get_live_matches()
 
-                    process_update(
-                        update
+                    if not matches:
+                        send_message(
+                            chat_id,
+                            "🔴 <b>LIVE</b>\n\n"
+                            "Сейчас активных матчей не найдено.",
+                            MAIN_KEYBOARD
+                        )
+                    else:
+                        send_message(
+                            chat_id,
+                            f"🔴 <b>LIVE</b>\n\n"
+                            f"Найдено матчей: "
+                            f"<b>{len(matches)}</b>\n\n"
+                            f"Выбери матч:",
+                            live_keyboard(matches)
+                        )
+
+                except Exception as e:
+                    print("LIVE ERROR:", e)
+
+                    send_message(
+                        chat_id,
+                        "⚠️ Не удалось получить LIVE-матчи.\n"
+                        "Проверь логи Render.",
+                        MAIN_KEYBOARD
+                    )
+
+                return
+
+            if text == "📅 МАТЧИ СЕГОДНЯ":
+                try:
+                    matches = get_today_matches()
+
+                    send_message(
+                        chat_id,
+                        today_text(matches),
+                        MAIN_KEYBOARD
                     )
 
                 except Exception as e:
+                    print("TODAY ERROR:", e)
 
-                    print(
-                        "UPDATE ERROR:",
-                        type(e).__name__,
-                        str(e)
+                    send_message(
+                        chat_id,
+                        "⚠️ Не удалось получить матчи.",
+                        MAIN_KEYBOARD
                     )
 
-        except Exception as e:
+                return
 
-            print(
-                "MAIN ERROR:",
-                type(e).__name__,
-                str(e)
+        # Inline button
+        callback = update.get("callback_query")
+
+        if callback:
+            callback_id = callback.get("id")
+            data = callback.get("data", "")
+            chat_id = callback["message"]["chat"]["id"]
+
+            answer_callback(callback_id)
+
+            if data.startswith("match:"):
+                match_id = data.split(":", 1)[1]
+
+                try:
+                    result = analyze_match(match_id)
+
+                    send_message(
+                        chat_id,
+                        result,
+                        MAIN_KEYBOARD
+                    )
+
+                except Exception as e:
+                    print("MATCH ERROR:", e)
+
+                    send_message(
+                        chat_id,
+                        "⚠️ Ошибка анализа матча.\n"
+                        "Проверь логи Render.",
+                        MAIN_KEYBOARD
+                    )
+
+    except Exception as e:
+        print("UPDATE ERROR:", e)
+
+
+# =========================================================
+# TELEGRAM POLLING
+# =========================================================
+
+def bot_loop():
+    offset = 0
+
+    print("FOOTBALL LIVE BOT STARTED")
+
+    while True:
+        try:
+            result = telegram(
+                "getUpdates",
+                {
+                    "timeout": 30,
+                    "offset": offset,
+                    "allowed_updates": json.dumps(
+                        ["message", "callback_query"]
+                    )
+                }
             )
 
+            updates = result.get("result", [])
+
+            for update in updates:
+                offset = update["update_id"] + 1
+                process_update(update)
+
+        except Exception as e:
+            print("POLLING ERROR:", e)
             time.sleep(5)
 
 
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
+# =========================================================
+# HEALTH SERVER FOR RENDER
+# =========================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-
         self.send_response(200)
-
         self.send_header(
             "Content-Type",
             "text/plain; charset=utf-8"
         )
-
         self.end_headers()
-
         self.wfile.write(
-            b"Football Live Bot is running"
+            b"Football Live Bot is running."
         )
 
-    def log_message(
-        self,
-        format,
-        *args
-    ):
+    def log_message(self, format, *args):
         return
 
 
-def start_web_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
+def health_server():
+    port = int(os.environ.get("PORT", "10000"))
 
     server = HTTPServer(
         ("0.0.0.0", port),
         HealthHandler
     )
 
+    print(f"Health server listening on {port}")
+
     server.serve_forever()
 
 
-if __name__ == "__main__":
+# =========================================================
+# START
+# =========================================================
 
+if __name__ == "__main__":
     threading.Thread(
-        target=start_web_server,
+        target=health_server,
         daemon=True
     ).start()
 
-    main()
+    bot_loop()
