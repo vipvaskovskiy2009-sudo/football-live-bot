@@ -1,1203 +1,1060 @@
 import os
-import json
-import time
-import threading
-import urllib.request
-import urllib.parse
+import math
+import asyncio
+import logging
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from aiohttp import web, ClientSession
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-PITCH_API_KEY = os.getenv("PITCH_API_KEY") or os.getenv("FOOTBALL_API_KEY")
-PITCH_API = "https://api.pitchapi.dev/v1"
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/"
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+# Основная лига.
+# Для экономии лимита The Odds API оставляем одну лигу.
+SPORT = os.getenv("SPORT", "soccer_epl")
+
+REGIONS = "eu"
+MARKETS = "h2h"
+
+# Стратегия
+CHECK_EVERY_MINUTES = 15
+KELLY_FRACTION = 0.15
+VALUE_THRESHOLD = 0.04
+
+MIN_MINUTE = 10
+MAX_MINUTE = 80
+
+BANKROLL_START = 100.0
+
+PORT = int(os.getenv("PORT", "10000"))
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN / BOT_TOKEN not found")
 
-if not PITCH_API_KEY:
-    raise RuntimeError("PITCH_API_KEY / FOOTBALL_API_KEY not found")
+if not ODDS_API_KEY:
+    raise RuntimeError("ODDS_API_KEY not found")
 
-CHECK_EVERY = 120
-MIN_MINUTE = 5
-MAX_MINUTE = 85
-MIN_XG = 0.55
-MIN_SHOTS = 6
-MIN_TARGET = 2
-MIN_PROB = 0.60
-MIN_ADV = 0.15
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+# =========================================================
+# STATE
+# =========================================================
+
+state = {
+    "bankroll": BANKROLL_START,
+    "bets_placed": 0,
+    "total_staked": 0.0,
+    "wins": 0,
+    "losses": 0,
+    "signals_sent": 0,
+    "scans": 0,
+    "last_scan": "—",
+    "api_remaining": "?",
+}
 
 subscribers = set()
-sent_signals = set()
-state = {"scans": 0, "signals": 0}
 
 
-def get_json(url, headers=None, timeout=30):
-    req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+# =========================================================
+# THE ODDS API
+# =========================================================
 
-
-def pitch(path, params=None):
-    url = PITCH_API + path
-
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-
-    try:
-        obj = get_json(
-            url,
-            {"X-API-KEY": PITCH_API_KEY}
-        )
-        return obj.get("data", obj)
-
-    except Exception as e:
-        print("PITCH ERROR", path, e)
-        return None
-
-
-def tg(method, data=None):
-    url = TELEGRAM_API + method
-
-    if data is None:
-        req = urllib.request.Request(url)
-    else:
-        body = urllib.parse.urlencode(data).encode("utf-8")
-        req = urllib.request.Request(url, data=body)
-
-    with urllib.request.urlopen(req, timeout=35) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def send(chat_id, text, keyboard=None):
-    data = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-
-    if keyboard:
-        data["reply_markup"] = json.dumps(
-            keyboard,
-            ensure_ascii=False
-        )
-
-    try:
-        tg("sendMessage", data)
-    except Exception as e:
-        print("TELEGRAM ERROR", e)
-
-
-def callback_answer(cid):
-    try:
-        tg(
-            "answerCallbackQuery",
-            {"callback_query_id": cid}
-        )
-    except Exception:
-        pass
-
-
-def num(x):
-    try:
-        if x is None:
-            return 0.0
-
-        if isinstance(x, (int, float)):
-            return float(x)
-
-        s = str(x).strip()
-
-        if "(" in s:
-            s = s.split("(")[0].strip()
-
-        return float(s)
-
-    except Exception:
-        return 0.0
-
-
-def name(team):
-    if isinstance(team, dict):
-        return str(
-            team.get("name")
-            or team.get("short_name")
-            or "Team"
-        )
-
-    return str(team or "Team")
-
-
-def teams(m):
-    return (
-        name(m.get("home_team")),
-        name(m.get("away_team"))
+async def fetch_odds(session):
+    url = (
+        f"{ODDS_API_BASE}/sports/{SPORT}/odds"
+        f"?apiKey={ODDS_API_KEY}"
+        f"&regions={REGIONS}"
+        f"&markets={MARKETS}"
+        f"&oddsFormat=decimal"
+        f"&dateFormat=iso"
     )
 
-
-def mid(m):
-    return m.get("id") or m.get("match_id")
-
-
-def score(m):
-    home = m.get(
-        "score_home",
-        m.get("home_score", 0)
-    )
-
-    away = m.get(
-        "score_away",
-        m.get("away_score", 0)
-    )
-
-    return int(num(home)), int(num(away))
-
-
-def minute(m):
-    if m.get("minute") is not None:
-        return int(num(m["minute"]))
-
-    raw = (
-        m.get("time_utc")
-        or m.get("kickoff")
-        or m.get("start_time")
-    )
-
-    if not raw:
-        return 0
-
     try:
-        start = datetime.fromisoformat(
-            str(raw).replace("Z", "+00:00")
-        )
+        async with session.get(url, timeout=30) as response:
 
-        seconds = (
-            datetime.now(timezone.utc) - start
-        ).total_seconds()
+            remaining = response.headers.get(
+                "x-requests-remaining",
+                "?"
+            )
 
-        return max(0, int(seconds / 60))
+            state["api_remaining"] = remaining
 
-    except Exception:
-        return 0
+            if response.status != 200:
+                text = await response.text()
 
-
-def today():
-    date = datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d")
-
-    data = pitch(
-        "/date/" + date,
-        {"status": "all"}
-    )
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        return data.get("matches", [])
-
-    return []
-
-
-def live():
-    result = []
-
-    for match in today():
-        status = str(
-            match.get("status", "")
-        ).lower()
-
-        if status in (
-            "finished",
-            "not_started",
-            "scheduled",
-            "cancelled",
-            "postponed",
-            "fixture"
-        ):
-            continue
-
-        mm = minute(match)
-
-        if 0 <= mm <= 130:
-            match["_minute"] = mm
-            result.append(match)
-
-    return result
-
-
-def parse_stats(data):
-    result = {
-        "hxg": 0.0,
-        "axg": 0.0,
-        "hs": 0,
-        "as": 0,
-        "ht": 0,
-        "at": 0
-    }
-
-    if not isinstance(data, dict):
-        return result
-
-    for period in data.get("periods", []):
-        period_name = str(
-            period.get("period", "")
-        ).lower()
-
-        if period_name not in (
-            "all",
-            "match",
-            "full"
-        ):
-            continue
-
-        for group in period.get("groups", []):
-            for item in group.get("items", []):
-                key = str(
-                    item.get("key", "")
-                ).lower()
-
-                home = num(
-                    item.get("home")
+                logging.warning(
+                    f"OddsAPI {response.status}: {text}"
                 )
 
-                away = num(
-                    item.get("away")
-                )
+                return []
 
-                if key in (
-                    "expected_goals",
-                    "xg"
-                ):
-                    result["hxg"] = home
-                    result["axg"] = away
+            data = await response.json()
 
-                elif key in (
-                    "total_shots",
-                    "shots"
-                ):
-                    result["hs"] = int(home)
-                    result["as"] = int(away)
+            logging.info(
+                f"OddsAPI: {len(data)} matches | "
+                f"remaining: {remaining}"
+            )
 
-                elif key in (
-                    "shots_on_target",
-                    "shots_on_goal",
-                    "on_target"
-                ):
-                    result["ht"] = int(home)
-                    result["at"] = int(away)
+            return data
 
-    return result
+    except Exception as e:
+        logging.error(
+            f"OddsAPI error: {e}"
+        )
+        return []
 
 
-def parse_shots(data, home_id, away_id):
-    result = {
-        "hxg": 0.0,
-        "axg": 0.0,
-        "hxgot": 0.0,
-        "axgot": 0.0,
-        "hs": 0,
-        "as": 0,
-        "ht": 0,
-        "at": 0
-    }
+def parse_match_odds(match):
 
-    if not isinstance(data, dict):
-        return result
+    home_odds = []
+    draw_odds = []
+    away_odds = []
 
-    periods = data.get(
-        "periods",
+    for bookmaker in match.get(
+        "bookmakers",
         []
-    )
+    ):
 
-    if not periods:
-        shots = data.get(
-            "shots",
-            []
-        )
-
-        if isinstance(shots, list):
-            periods = [
-                {"shots": shots}
-            ]
-
-    for period in periods:
-        for shot in period.get(
-            "shots",
+        for market in bookmaker.get(
+            "markets",
             []
         ):
-            team_id = (
-                shot.get("team_id")
-                or shot.get("teamId")
-            )
 
-            xg = num(
-                shot.get(
-                    "expected_goals",
-                    shot.get("xg")
-                )
-            )
+            if market.get("key") != "h2h":
+                continue
 
-            xgot = num(
-                shot.get(
-                    "expected_goals_on_target",
-                    shot.get("xgot")
-                )
-            )
+            for outcome in market.get(
+                "outcomes",
+                []
+            ):
 
-            target = shot.get(
-                "is_on_target",
-                shot.get("on_target", False)
-            )
+                name = outcome.get("name")
+                price = outcome.get("price")
 
-            if team_id == home_id:
-                result["hs"] += 1
-                result["hxg"] += xg
-                result["hxgot"] += xgot
+                if name is None or price is None:
+                    continue
 
-                if bool(target):
-                    result["ht"] += 1
+                try:
+                    price = float(price)
+                except Exception:
+                    continue
 
-            elif team_id == away_id:
-                result["as"] += 1
-                result["axg"] += xg
-                result["axgot"] += xgot
+                if name == match["home_team"]:
+                    home_odds.append(price)
 
-                if bool(target):
-                    result["at"] += 1
+                elif name == match["away_team"]:
+                    away_odds.append(price)
 
-    return result
+                elif name.lower() == "draw":
+                    draw_odds.append(price)
+
+    def average(values):
+        if not values:
+            return None
+
+        return sum(values) / len(values)
+
+    return {
+        "HOME": average(home_odds),
+        "DRAW": average(draw_odds),
+        "AWAY": average(away_odds),
+    }
 
 
-def parse_red(data, home_id, away_id):
-    home = 0
-    away = 0
+# =========================================================
+# FLASHSCORE
+# =========================================================
 
-    if not isinstance(data, dict):
-        return home, away
+def parse_minute(value):
 
-    for event in data.get(
+    if value is None:
+        return 0
+
+    if isinstance(value, int):
+        return value
+
+    text = str(value).strip()
+
+    digits = ""
+
+    for char in text:
+        if char.isdigit():
+            digits += char
+        else:
+            break
+
+    try:
+        return int(digits)
+    except Exception:
+        return 0
+
+
+def get_red_cards(match):
+
+    red_home = 0
+    red_away = 0
+
+    events = getattr(
+        match,
         "events",
         []
-    ):
+    ) or []
+
+    home = (
+        getattr(
+            match,
+            "home_team_name",
+            ""
+        ) or ""
+    ).lower()
+
+    away = (
+        getattr(
+            match,
+            "away_team_name",
+            ""
+        ) or ""
+    ).lower()
+
+    for event in events:
+
         event_type = str(
-            event.get(
-                "event_type",
-                event.get("type", "")
-            )
+            getattr(
+                event,
+                "type",
+                ""
+            ) or ""
         ).lower()
 
-        team_id = (
-            event.get("team_id")
-            or event.get("teamId")
+        description = str(
+            getattr(
+                event,
+                "description",
+                ""
+            ) or ""
+        ).lower()
+
+        combined = (
+            event_type + " " + description
         )
 
-        if "red" not in event_type:
+        if "red" not in combined:
             continue
 
-        if team_id == home_id:
-            home += 1
+        # Исключаем просто текст про возможную карточку
+        # и считаем событие красной карточкой.
+        event_text = str(event).lower()
 
-        elif team_id == away_id:
-            away += 1
+        if home and home in event_text:
+            red_home += 1
 
-    return home, away
+        elif away and away in event_text:
+            red_away += 1
+
+        else:
+            # Если сторону определить нельзя,
+            # не приписываем карточку случайно.
+            continue
+
+    return red_home, red_away
 
 
-def get_momentum(data, match_minute):
-    if not isinstance(data, dict):
-        return 0.0
+async def fetch_flashscore_live():
 
-    values = []
+    result = {}
 
-    for point in data.get(
-        "points",
-        []
-    ):
-        point_minute = num(
-            point.get("minute")
+    try:
+
+        from flashscore import FlashscoreApi
+
+        api = FlashscoreApi()
+
+        matches = api.get_today_matches()
+
+        for match in matches:
+
+            try:
+                match.load_content()
+            except Exception:
+                continue
+
+            home = getattr(
+                match,
+                "home_team_name",
+                None
+            )
+
+            away = getattr(
+                match,
+                "away_team_name",
+                None
+            )
+
+            if not home or not away:
+                continue
+
+            minute = parse_minute(
+                getattr(
+                    match,
+                    "minute",
+                    0
+                )
+            )
+
+            home_score = getattr(
+                match,
+                "home_team_score",
+                0
+            ) or 0
+
+            away_score = getattr(
+                match,
+                "away_team_score",
+                0
+            ) or 0
+
+            red_home, red_away = get_red_cards(
+                match
+            )
+
+            key = (
+                f"{home}-{away}"
+                .lower()
+            )
+
+            result[key] = {
+                "minute": minute,
+                "score": (
+                    int(home_score),
+                    int(away_score)
+                ),
+                "red_home": red_home,
+                "red_away": red_away,
+            }
+
+    except ImportError:
+
+        logging.error(
+            "fs-football-fork is not installed"
         )
 
-        value = num(
-            point.get("value")
+    except Exception as e:
+
+        logging.error(
+            f"Flashscore error: {e}"
         )
+
+    logging.info(
+        f"Flashscore LIVE: {len(result)}"
+    )
+
+    return result
+
+
+def match_flashscore(
+    odds_match,
+    flash_data
+):
+
+    home = (
+        odds_match["home_team"]
+        .lower()
+    )
+
+    away = (
+        odds_match["away_team"]
+        .lower()
+    )
+
+    # Сначала точное совпадение
+    exact_key = f"{home}-{away}"
+
+    if exact_key in flash_data:
+        return flash_data[exact_key]
+
+    # Затем более мягкое совпадение
+    home_words = home.split()
+    away_words = away.split()
+
+    if not home_words or not away_words:
+        return None
+
+    home_first = home_words[0]
+    away_first = away_words[0]
+
+    for key, value in flash_data.items():
 
         if (
-            match_minute - 10
-            <= point_minute
-            <= match_minute
+            home_first in key
+            and away_first in key
         ):
-            values.append(value)
+            return value
 
-    if not values:
-        return 0.0
-
-    return sum(values) / len(values)
+    return None
 
 
-def probability(
-    home_xg,
-    away_xg,
-    match_minute,
-    score_home,
-    score_away,
-    momentum,
+# =========================================================
+# POISSON
+# =========================================================
+
+def poisson_prob(lam, k):
+
+    if lam <= 0:
+        return (
+            1.0
+            if k == 0
+            else 0.0
+        )
+
+    return (
+        math.exp(-lam)
+        * (lam ** k)
+        / math.factorial(k)
+    )
+
+
+def calculate_live_intensity(
+    base_home,
+    base_away,
+    minute,
+    score_diff,
     red_home,
     red_away
 ):
-    elapsed = max(
-        5,
-        min(match_minute, 90)
+
+    time_left = max(
+        0,
+        90 - minute
+    ) / 90.0
+
+    if score_diff < 0:
+
+        base_home *= 1.15
+        base_away *= 0.90
+
+    elif score_diff > 0:
+
+        base_home *= 0.90
+        base_away *= 1.15
+
+    base_home *= (
+        0.75 ** red_home
     )
 
-    remaining = max(
-        1,
-        90 - elapsed
+    base_away *= (
+        0.75 ** red_away
     )
 
-    home_lambda = (
-        home_xg / elapsed
-    ) * remaining
+    lam_h = max(
+        0.05,
+        base_home
+        * time_left
+        * 1.10
+    )
 
-    away_lambda = (
-        away_xg / elapsed
-    ) * remaining
+    lam_a = max(
+        0.05,
+        base_away
+        * time_left
+        * 0.90
+    )
 
-    if score_home < score_away:
-        home_lambda *= 1.15
-        away_lambda *= 0.90
+    return lam_h, lam_a
 
-    elif score_away < score_home:
-        home_lambda *= 0.90
-        away_lambda *= 1.15
 
-    if momentum > 0:
-        home_lambda *= (
-            1 + min(
-                momentum / 100,
-                0.25
+def match_probabilities(
+    lam_h,
+    lam_a,
+    max_goals=6
+):
+
+    p_home = 0.0
+    p_draw = 0.0
+    p_away = 0.0
+
+    for i in range(max_goals + 1):
+
+        for j in range(max_goals + 1):
+
+            p = (
+                poisson_prob(lam_h, i)
+                * poisson_prob(lam_a, j)
             )
-        )
 
-        away_lambda *= (
-            1 - min(
-                momentum / 200,
-                0.15
-            )
-        )
+            if i > j:
+                p_home += p
 
-    elif momentum < 0:
-        away_lambda *= (
-            1 + min(
-                abs(momentum) / 100,
-                0.25
-            )
-        )
+            elif i == j:
+                p_draw += p
 
-        home_lambda *= (
-            1 - min(
-                abs(momentum) / 200,
-                0.15
-            )
-        )
-
-    home_lambda *= 0.75 ** red_home
-    away_lambda *= 0.75 ** red_away
+            else:
+                p_away += p
 
     total = (
-        home_lambda
-        + away_lambda
+        p_home
+        + p_draw
+        + p_away
     )
 
-    if total <= 0:
-        return 0.5, 0.5
+    if total == 0:
+        return None
 
-    return (
-        home_lambda / total,
-        away_lambda / total
-    )
-
-
-def analyze(match_id):
-    match = pitch(
-        "/matches/" + str(match_id)
-    )
-
-    if not isinstance(match, dict):
-        return False, (
-            "⚪ <b>ПРОПУСК</b>\n\n"
-            "Нет данных матча."
-        )
-
-    home_team = match.get(
-        "home_team",
-        {}
-    )
-
-    away_team = match.get(
-        "away_team",
-        {}
-    )
-
-    home_id = home_team.get("id")
-    away_id = away_team.get("id")
-
-    home = name(home_team)
-    away = name(away_team)
-
-    score_home, score_away = score(
-        match
-    )
-
-    match_minute = minute(
-        match
-    )
-
-    if match_minute < MIN_MINUTE:
-        return False, (
-            "⚪ <b>ПРОПУСК</b>\n\n"
-            f"⚽ {home} — {away}\n"
-            f"⏱ {match_minute}′\n"
-            "Меньше 5 минут."
-        )
-
-    if match_minute > MAX_MINUTE:
-        return False, (
-            "⚪ <b>ПРОПУСК</b>\n\n"
-            f"⚽ {home} — {away}\n"
-            f"⏱ {match_minute}′\n"
-            "Поздняя стадия."
-        )
-
-    stats = parse_stats(
-        pitch(
-            "/matches/"
-            + str(match_id)
-            + "/stats"
-        )
-    )
-
-    shots = parse_shots(
-        pitch(
-            "/matches/"
-            + str(match_id)
-            + "/shots"
-        ),
-        home_id,
-        away_id
-    )
-
-    red_home, red_away = parse_red(
-        pitch(
-            "/matches/"
-            + str(match_id)
-            + "/events"
-        ),
-        home_id,
-        away_id
-    )
-
-    mom = get_momentum(
-        pitch(
-            "/matches/"
-            + str(match_id)
-            + "/momentum"
-        ),
-        match_minute
-    )
-
-    home_xg = max(
-        stats["hxg"],
-        shots["hxg"]
-    )
-
-    away_xg = max(
-        stats["axg"],
-        shots["axg"]
-    )
-
-    home_shots = max(
-        stats["hs"],
-        shots["hs"]
-    )
-
-    away_shots = max(
-        stats["as"],
-        shots["as"]
-    )
-
-    home_target = max(
-        stats["ht"],
-        shots["ht"]
-    )
-
-    away_target = max(
-        stats["at"],
-        shots["at"]
-    )
-
-    home_xgot = shots["hxgot"]
-    away_xgot = shots["axgot"]
-
-    total_xg = (
-        home_xg
-        + away_xg
-    )
-
-    total_shots = (
-        home_shots
-        + away_shots
-    )
-
-    total_target = (
-        home_target
-        + away_target
-    )
-
-    total_xgot = (
-        home_xgot
-        + away_xgot
-    )
-
-    home_probability, away_probability = probability(
-        home_xg,
-        away_xg,
-        match_minute,
-        score_home,
-        score_away,
-        mom,
-        red_home,
-        red_away
-    )
-
-    if home_probability >= away_probability:
-        next_team = home
-        prob = home_probability
-        opponent_prob = away_probability
-    else:
-        next_team = away
-        prob = away_probability
-        opponent_prob = home_probability
-
-    advantage = (
-        prob
-        - opponent_prob
-    )
-
-    filters = 0
-
-    if total_xg >= MIN_XG:
-        filters += 1
-
-    if total_shots >= MIN_SHOTS:
-        filters += 1
-
-    if total_target >= MIN_TARGET:
-        filters += 1
-
-    if total_xgot >= 0.35:
-        filters += 1
-
-    if prob >= MIN_PROB:
-        filters += 1
-
-    if advantage >= MIN_ADV:
-        filters += 1
-
-    signal = (
-        filters >= 4
-        and prob >= MIN_PROB
-        and advantage >= MIN_ADV
-    )
-
-    if signal:
-        state["signals"] += 1
-
-    label = (
-        "🟢 <b>СИГНАЛ</b>"
-        if signal
-        else "⚪ <b>ПРОПУСК</b>"
-    )
-
-    text = (
-        f"{label}\n\n"
-        f"⚽ <b>{home} — {away}</b>\n"
-        f"⏱ {match_minute}′\n"
-        f"📊 Счёт: "
-        f"{score_home}:{score_away}\n\n"
-        f"🎯 Следующий гол: "
-        f"<b>{next_team}</b>\n"
-        f"📈 Вероятность: "
-        f"<b>{prob * 100:.1f}%</b>\n"
-        f"📊 Преимущество: "
-        f"<b>{advantage * 100:.1f}%</b>\n\n"
-        f"xG: {home_xg:.2f} — "
-        f"{away_xg:.2f}\n"
-        f"xGOT: {home_xgot:.2f} — "
-        f"{away_xgot:.2f}\n"
-        f"Удары: {home_shots} — "
-        f"{away_shots}\n"
-        f"В створ: {home_target} — "
-        f"{away_target}\n"
-        f"Momentum: {mom:.2f}\n"
-        f"Красные: "
-        f"{red_home} — {red_away}\n"
-        f"Фильтры: {filters}/6"
-    )
-
-    return signal, text
-
-
-def main_keyboard():
     return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "🔴 LIVE",
-                    "callback_data": "live"
-                }
-            ],
-            [
-                {
-                    "text": "📅 МАТЧИ СЕГОДНЯ",
-                    "callback_data": "today"
-                }
-            ],
-            [
-                {
-                    "text": "📊 СТАТУС",
-                    "callback_data": "status"
-                }
-            ]
-        ]
+        "HOME": p_home / total,
+        "DRAW": p_draw / total,
+        "AWAY": p_away / total,
     }
 
 
-def match_keyboard(match_id):
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "🔄 АНАЛИЗ",
-                    "callback_data":
-                        f"match:{match_id}"
-                }
-            ],
-            [
-                {
-                    "text": "🔴 LIVE",
-                    "callback_data": "live"
-                }
-            ],
-            [
-                {
-                    "text": "🏠 МЕНЮ",
-                    "callback_data": "home"
-                }
-            ]
-        ]
+# =========================================================
+# KELLY
+# =========================================================
+
+def kelly_stake(
+    probability,
+    odds,
+    bankroll
+):
+
+    b = odds - 1
+
+    if b <= 0:
+        return 0.0
+
+    q = 1 - probability
+
+    kelly = (
+        b * probability - q
+    ) / b
+
+    stake = (
+        bankroll
+        * max(0.0, kelly)
+        * KELLY_FRACTION
+    )
+
+    return round(
+        stake,
+        2
+    )
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+async def send_to_all(
+    application,
+    text
+):
+
+    if not subscribers:
+        logging.warning(
+            "Нет подписчиков Telegram"
+        )
+        return
+
+    dead = []
+
+    for chat_id in list(subscribers):
+
+        try:
+
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML"
+            )
+
+        except Exception as e:
+
+            logging.error(
+                f"Telegram error {chat_id}: {e}"
+            )
+
+            dead.append(chat_id)
+
+    for chat_id in dead:
+        subscribers.discard(chat_id)
+
+
+# =========================================================
+# ANALYSIS
+# =========================================================
+
+async def analyze_and_send(
+    application,
+    odds_match,
+    flash
+):
+
+    home = odds_match["home_team"]
+    away = odds_match["away_team"]
+
+    parsed = parse_match_odds(
+        odds_match
+    )
+
+    if not all([
+        parsed["HOME"],
+        parsed["DRAW"],
+        parsed["AWAY"]
+    ]):
+        return
+
+    if not flash:
+        return
+
+    minute = flash["minute"]
+
+    h_goals, a_goals = flash["score"]
+
+    # ФИЛЬТР МИНУТЫ
+    if (
+        minute < MIN_MINUTE
+        or minute > MAX_MINUTE
+    ):
+        return
+
+    score_diff = (
+        h_goals - a_goals
+    )
+
+    # Базовая интенсивность
+    base_home = 1.4
+    base_away = 1.1
+
+    lam_h, lam_a = (
+        calculate_live_intensity(
+            base_home,
+            base_away,
+            minute,
+            score_diff,
+            flash["red_home"],
+            flash["red_away"]
+        )
+    )
+
+    probs = match_probabilities(
+        lam_h,
+        lam_a
+    )
+
+    if not probs:
+        return
+
+    odds_map = {
+        "HOME": parsed["HOME"],
+        "DRAW": parsed["DRAW"],
+        "AWAY": parsed["AWAY"]
     }
 
+    label_map = {
+        "HOME": "П1",
+        "DRAW": "X",
+        "AWAY": "П2"
+    }
 
-def live_keyboard():
-    matches = live()
-    rows = []
+    # Проверяем HOME / DRAW / AWAY
+    for outcome, probability in probs.items():
 
-    for match in matches[:20]:
-        match_id_value = mid(match)
+        odd = odds_map[outcome]
 
-        if match_id_value is None:
+        if not odd or odd <= 1.05:
             continue
 
-        home, away = teams(match)
-        score_home, score_away = score(match)
+        # Вероятность букмекера
+        implied = 1 / odd
 
-        rows.append([
-            {
-                "text": (
-                    f"⚽ {home} "
-                    f"{score_home}:{score_away} "
-                    f"{away} "
-                    f"({match.get('_minute', 0)}′)"
-                ),
-                "callback_data":
-                    f"match:{match_id_value}"
-            }
-        ])
-
-    rows.append([
-        {
-            "text": "🔄 ОБНОВИТЬ",
-            "callback_data": "live"
-        }
-    ])
-
-    rows.append([
-        {
-            "text": "🏠 МЕНЮ",
-            "callback_data": "home"
-        }
-    ])
-
-    return (
-        f"🔴 <b>LIVE: {len(matches)}</b>\n\n"
-        "Выбери матч:",
-        {
-            "inline_keyboard": rows
-        }
-    )
-
-
-def today_text():
-    matches = today()
-
-    lines = [
-        f"📅 <b>МАТЧИ СЕГОДНЯ: "
-        f"{len(matches)}</b>",
-        ""
-    ]
-
-    for match in matches[:30]:
-        home, away = teams(match)
-        score_home, score_away = score(match)
-
-        lines.append(
-            f"⚽ {home} — {away} "
-            f"{score_home}:{score_away}"
+        # VALUE
+        value = (
+            probability
+            - implied
         )
 
-    return "\n".join(lines)
+        # Минимум +4%
+        if value <= VALUE_THRESHOLD:
+            continue
 
+        # Kelly 15%
+        stake = kelly_stake(
+            probability,
+            odd,
+            state["bankroll"]
+        )
 
-def process_update(update):
-    message = update.get("message")
+        if stake < 1:
+            continue
 
-    if message:
-        chat_id = message.get(
-            "chat",
-            {}
-        ).get("id")
+        label = label_map[outcome]
 
-        text = str(
-            message.get(
-                "text",
-                ""
-            )
-        ).strip()
+        msg = (
+            "⚽ <b>LIVE VALUE</b>\n\n"
+            f"<b>{home} — {away}</b>\n"
+            f"Счёт: <b>{h_goals}:{a_goals}</b> | "
+            f"{minute}'\n\n"
+            f"🎯 Ставка: <b>{label}</b>\n"
+            f"💰 Коэф.: <b>{odd:.2f}</b>\n\n"
+            f"🤖 Наша вероятность: "
+            f"<b>{probability * 100:.1f}%</b>\n"
+            f"📉 Вероятность по коэффициенту: "
+            f"{implied * 100:.1f}%\n"
+            f"📈 VALUE: "
+            f"<b>+{value * 100:.1f}%</b>\n\n"
+            f"💵 Kelly 15%: "
+            f"<b>${stake:.2f}</b>\n\n"
+            f"🟥 Красные: "
+            f"{flash['red_home']} — "
+            f"{flash['red_away']}\n\n"
+            "⚠️ Сигнал рассчитан моделью; "
+            "ставка не является гарантией результата."
+        )
 
-        if chat_id is not None:
-            subscribers.add(chat_id)
+        await send_to_all(
+            application,
+            msg
+        )
 
-        if (
-            chat_id is not None
-            and text.startswith("/start")
-        ):
-            send(
-                chat_id,
-                (
-                    "⚽ <b>FOOTBALL LIVE</b>\n\n"
-                    "Выбери действие:"
-                ),
-                main_keyboard()
-            )
+        state["signals_sent"] += 1
+        state["bets_placed"] += 1
+        state["total_staked"] += stake
 
-        elif (
-            chat_id is not None
-            and text.startswith("/status")
-        ):
-            send(
-                chat_id,
-                (
-                    "📊 <b>СТАТУС</b>\n\n"
-                    f"Сканирований: "
-                    f"{state['scans']}\n"
-                    f"Сигналов: "
-                    f"{state['signals']}\n"
-                    f"Подписчиков: "
-                    f"{len(subscribers)}"
-                ),
-                main_keyboard()
-            )
+        logging.info(
+            f"SIGNAL | {home} vs {away} | "
+            f"{outcome} @ {odd:.2f} | "
+            f"value={value:.4f}"
+        )
 
+        # Только один сигнал на матч за проход анализа
         return
 
-    callback = update.get(
-        "callback_query"
-    )
 
-    if not callback:
-        return
+# =========================================================
+# MAIN SCANNER
+# =========================================================
 
-    chat_id = callback.get(
-        "message",
-        {}
-    ).get(
-        "chat",
-        {}
-    ).get("id")
-
-    data = callback.get(
-        "data",
-        ""
-    )
-
-    if chat_id is not None:
-        subscribers.add(chat_id)
-
-    callback_answer(
-        callback.get("id")
-    )
-
-    if data == "home":
-        send(
-            chat_id,
-            (
-                "⚽ <b>FOOTBALL LIVE</b>\n\n"
-                "Выбери действие:"
-            ),
-            main_keyboard()
-        )
-
-    elif data == "live":
-        text, keyboard = live_keyboard()
-
-        send(
-            chat_id,
-            text,
-            keyboard
-        )
-
-    elif data == "today":
-        send(
-            chat_id,
-            today_text(),
-            main_keyboard()
-        )
-
-    elif data == "status":
-        send(
-            chat_id,
-            (
-                "📊 <b>СТАТУС</b>\n\n"
-                f"Сканирований: "
-                f"{state['scans']}\n"
-                f"Сигналов: "
-                f"{state['signals']}\n"
-                f"Подписчиков: "
-                f"{len(subscribers)}"
-            ),
-            main_keyboard()
-        )
-
-    elif data.startswith("match:"):
-        match_id_value = data.split(
-            ":",
-            1
-        )[1]
-
-        _, text = analyze(
-            match_id_value
-        )
-
-        send(
-            chat_id,
-            text,
-            match_keyboard(
-                match_id_value
-            )
-        )
-
-
-def telegram_loop():
-    offset = 0
-
-    print(
-        "TELEGRAM LOOP STARTED"
-    )
-
-    while True:
-        try:
-            result = tg(
-                "getUpdates",
-                {
-                    "timeout": 50,
-                    "offset": offset
-                }
-            )
-
-            for update in result.get(
-                "result",
-                []
-            ):
-                offset = (
-                    update.get(
-                        "update_id",
-                        offset
-                    )
-                    + 1
-                )
-
-                try:
-                    process_update(
-                        update
-                    )
-                except Exception as e:
-                    print(
-                        "UPDATE ERROR",
-                        e
-                    )
-
-        except Exception as e:
-            print(
-                "TELEGRAM LOOP ERROR",
-                e
-            )
-
-            time.sleep(5)
-
-
-def scanner():
-    print(
-        "SCANNER STARTED"
-    )
-
-    while True:
-        try:
-            matches = live()
-
-            state["scans"] += 1
-
-            print(
-                "LIVE MATCHES:",
-                len(matches)
-            )
-
-            for match in matches:
-                match_id_value = mid(match)
-                match_minute = match.get(
-                    "_minute",
-                    0
-                )
-
-                if match_id_value is None:
-                    continue
-
-                if match_minute < MIN_MINUTE:
-                    continue
-
-                if match_minute > MAX_MINUTE:
-                    continue
-
-                signal, text = analyze(
-                    match_id_value
-                )
-
-                if not signal:
-                    continue
-
-                key = (
-                    f"{match_id_value}:"
-                    f"{match_minute // 5}"
-                )
-
-                if key in sent_signals:
-                    continue
-
-                sent_signals.add(key)
-
-                for chat_id in list(
-                    subscribers
-                ):
-                    send(
-                        chat_id,
-                        text,
-                        match_keyboard(
-                            match_id_value
-                        )
-                    )
-
-        except Exception as e:
-            print(
-                "SCANNER ERROR",
-                e
-            )
-
-        time.sleep(
-            CHECK_EVERY
-        )
-
-
-class Handler(
-    BaseHTTPRequestHandler
+async def scan_once(
+    application
 ):
-    def do_GET(self):
-        body = (
-            b"Football Live 3.0 is running."
+
+    state["scans"] += 1
+
+    state["last_scan"] = (
+        datetime.now(timezone.utc)
+        .strftime("%H:%M:%S UTC")
+    )
+
+    logging.info(
+        f"========== SCAN #{state['scans']} =========="
+    )
+
+    async with ClientSession() as session:
+
+        odds_list = await fetch_odds(
+            session
         )
 
-        self.send_response(200)
+    if not odds_list:
 
-        self.send_header(
-            "Content-Type",
-            "text/plain; "
-            "charset=utf-8"
+        logging.info(
+            "Odds API: матчей нет"
         )
 
-        self.send_header(
-            "Content-Length",
-            str(len(body))
+        return
+
+    flash = await asyncio.to_thread(
+        fetch_flashscore_live
+    )
+
+    if not flash:
+
+        logging.info(
+            "Flashscore: LIVE матчей нет"
         )
 
-        self.end_headers()
+        return
 
-        self.wfile.write(body)
+    for match in odds_list:
 
-    def log_message(
-        self,
-        fmt,
-        *args
-    ):
-        pass
+        flash_match = match_flashscore(
+            match,
+            flash
+        )
+
+        if not flash_match:
+            continue
+
+        await analyze_and_send(
+            application,
+            match,
+            flash_match
+        )
+
+        await asyncio.sleep(0.5)
 
 
-def health():
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
+async def scanner_loop(
+    application
+):
+
+    logging.info(
+        "LIVE scanner started"
+    )
+
+    while True:
+
+        try:
+
+            await scan_once(
+                application
+            )
+
+        except Exception as e:
+
+            logging.exception(
+                f"Scanner error: {e}"
+            )
+
+        await asyncio.sleep(
+            CHECK_EVERY_MINUTES * 60
+        )
+
+
+# =========================================================
+# TELEGRAM COMMANDS
+# =========================================================
+
+async def cmd_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    subscribers.add(chat_id)
+
+    await update.message.reply_text(
+        "⚽ <b>LIVE VALUE BOT</b>\n\n"
+        "Ты добавлен в список получателей сигналов.\n\n"
+        "Стратегия:\n"
+        "• минута 10–80\n"
+        "• Poisson\n"
+        "• счёт LIVE\n"
+        "• красные карточки\n"
+        "• Value ≥ 4%\n"
+        "• Kelly 15%\n\n"
+        "/status — статистика\n"
+        "/win — записать WIN\n"
+        "/loss — записать LOSS\n"
+        "/bank 100 — установить банк",
+        parse_mode="HTML"
+    )
+
+
+async def cmd_status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    total = (
+        state["wins"]
+        + state["losses"]
+    )
+
+    winrate = (
+        state["wins"] / total * 100
+        if total
+        else 0
+    )
+
+    await update.message.reply_text(
+        "📊 <b>СТАТУС</b>\n\n"
+        f"💰 Банк: ${state['bankroll']:.2f}\n"
+        f"📡 Сканирований: {state['scans']}\n"
+        f"🟢 Сигналов: {state['signals_sent']}\n"
+        f"💵 Сумма ставок: ${state['total_staked']:.2f}\n"
+        f"✅ WIN: {state['wins']}\n"
+        f"❌ LOSS: {state['losses']}\n"
+        f"📈 Winrate: {winrate:.1f}%\n"
+        f"👥 Подписчиков: {len(subscribers)}\n"
+        f"🔢 API осталось: {state['api_remaining']}\n"
+        f"🕐 Последний скан: {state['last_scan']}",
+        parse_mode="HTML"
+    )
+
+
+async def cmd_win(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    state["wins"] += 1
+
+    await update.message.reply_text(
+        "✅ WIN записан."
+    )
+
+
+async def cmd_loss(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    state["losses"] += 1
+
+    await update.message.reply_text(
+        "❌ LOSS записан."
+    )
+
+
+async def cmd_bank(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    try:
+
+        amount = float(
+            context.args[0]
+        )
+
+        if amount <= 0:
+            raise ValueError
+
+        state["bankroll"] = amount
+
+        await update.message.reply_text(
+            f"💰 Банк установлен: "
+            f"${amount:.2f}"
+        )
+
+    except (IndexError, ValueError):
+
+        await update.message.reply_text(
+            "Использование:\n"
+            "/bank 100"
+        )
+
+
+# =========================================================
+# RENDER HEALTH
+# =========================================================
+
+async def health(request):
+
+    return web.Response(
+        text=(
+            "Football Live Value Bot "
+            "is running."
         )
     )
 
-    server = HTTPServer(
-        (
-            "0.0.0.0",
-            port
-        ),
-        Handler
+
+async def start_health_server():
+
+    app = web.Application()
+
+    app.router.add_get(
+        "/",
+        health
     )
 
-    print(
-        "HEALTH SERVER STARTED:",
-        port
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
     )
 
-    server.serve_forever()
+    await site.start()
+
+    logging.info(
+        f"Health server on port {PORT}"
+    )
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def post_init(
+    application: Application
+):
+
+    await start_health_server()
+
+    asyncio.create_task(
+        scanner_loop(application)
+    )
+
+    logging.info(
+        "Scanner task created."
+    )
+
+
+def main():
+
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            cmd_start
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "status",
+            cmd_status
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "win",
+            cmd_win
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "loss",
+            cmd_loss
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "bank",
+            cmd_bank
+        )
+    )
+
+    logging.info(
+        "Football Live Value Bot starting..."
+    )
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    print(
-        "FOOTBALL LIVE 3.0 STARTED"
-    )
-
-    threading.Thread(
-        target=health,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=scanner,
-        daemon=True
-    ).start()
-
-    telegram_loop()
+    main()
