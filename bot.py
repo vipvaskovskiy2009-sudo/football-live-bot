@@ -533,8 +533,4 @@ def analyse_match(
         red_home = flash["red_home"]
         red_away = flash["red_away"]
 
-    else:
-
-        # Без Flashscore не выда
-
 
